@@ -171,7 +171,7 @@ class SileroVADStateful:
                     in_c = i
 
         # Second pass: by shape/rank heuristics for anything missing
-        float_inputs = [i for i in inputs if not i.type.startswith("tensor(int"))]
+        float_inputs = [i for i in inputs if not i.type.startswith("tensor(int")]
         if in_audio is None:
             # pick a float input with rank 2 as audio (1, N) is common
             cand = [i for i in float_inputs if rank(i) == 2]
