@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Conversation Mode with Silero VAD
+Conversation Mode with Silero VAD (stateful ONNX)
 - Mic index = 2
-- Loopback indices = 3, then 4 (fallback)
-- Opens devices at a supported native rate, resamples to 16 kHz for VAD
-- CPU-only ONNX (no GPU/DRM noise)
-- Auto-detect loopback channels (1 or 2), picks channel 0
-- Simple AEC (delayed subtraction) + volume ducking
+- Loopback indices = [3, 4] (fallback: try 3, then 4)
+- Opens devices at a supported native rate (e.g., 48 kHz), resamples to 16 kHz for VAD
+- Handles stateful Silero VAD: inputs (x/input, h/h1, c/c1, sr) and outputs (prob, hn, cn)
+- CPU-only ONNX; robust input/output name discovery
+- Auto-detect loopback channels (1 or 2), uses channel 0
+- Simple AEC (delayed subtraction) + volume ducking (ALSA → wpctl → pactl fallback)
 """
 
 import os
@@ -52,12 +53,9 @@ def nearest_working_samplerate(dev_index: int, desired: int, channels: int = 1) 
     """Find a samplerate that the device accepts for the given channel count."""
     dev = sd.query_devices(dev_index)
     candidates = []
-    # desired first
     if desired: candidates.append(int(desired))
-    # device default samplerate if present
     default_rate = int(dev.get("default_samplerate") or 0)
     if default_rate: candidates.append(default_rate)
-    # common fallbacks
     for r in (48000, 44100, 32000, 16000):
         if r not in candidates:
             candidates.append(r)
@@ -89,7 +87,7 @@ def init_mixer(preferred_controls=("PCM", "Master", "Speaker", "Playback")):
 
 def set_volume(mixer, vol_percent: int):
     """Set volume using ALSA mixer; fallback to wpctl/pactl if ALSA missing/ineffective."""
-    # 1) ALSA
+    # ALSA
     if mixer is not None:
         try:
             mixer.setvolume(int(vol_percent))
@@ -97,7 +95,7 @@ def set_volume(mixer, vol_percent: int):
         except Exception as e:
             print(f"ALSA mixer setvolume failed: {e}")
 
-    # 2) PipeWire (wpctl expects linear scalar 0.0–1.0)
+    # PipeWire (wpctl expects 0.0–1.0)
     if shutil.which("wpctl"):
         try:
             scalar = max(0.0, min(1.0, vol_percent / 100.0))
@@ -109,7 +107,7 @@ def set_volume(mixer, vol_percent: int):
         except Exception as e:
             print(f"wpctl volume set failed: {e}")
 
-    # 3) PulseAudio (pactl can use percentages)
+    # PulseAudio
     if shutil.which("pactl"):
         try:
             subprocess.run(
@@ -122,29 +120,157 @@ def set_volume(mixer, vol_percent: int):
 
     print("⚠️  Could not set volume via ALSA/wpctl/pactl. Ducking may not take effect.")
 
-def build_vad_session(onnx_path: str):
-    """Create ONNX Runtime session (CPU only) and map input names (audio, sr)."""
-    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-    inputs = sess.get_inputs()
-    in_name = None
-    sr_name = None
-    for i in inputs:
-        # sr is usually int64 scalar/1D
-        if i.type.startswith("tensor(int"):
-            sr_name = i.name
-        else:
-            in_name = i.name
-    # Fallback names if needed
-    in_name = in_name or "input"
-    sr_name = sr_name or "sr"
-    return sess, in_name, sr_name
+# -------- Silero VAD (stateful) session wrapper --------
 
-def get_vad_prob(session, in_name, sr_name, audio_frame_16k: np.ndarray) -> float:
-    """Run Silero VAD; audio_frame_16k is (N,1) float32 at 16k."""
-    x = audio_frame_16k.reshape(1, -1).astype(np.float32)
-    sr = np.array([VAD_SAMPLE_RATE], dtype=np.int64)
-    out = session.run(None, {in_name: x, sr_name: sr})[0]
-    return float(np.squeeze(out))
+class SileroVADStateful:
+    """
+    Handles stateful Silero VAD ONNX:
+      inputs: x/input (audio 1xN), h/h1, c/c1 (state tensors), sr (int64)
+      outputs: prob, hn, cn (names vary)
+    Discovers names & shapes at runtime and maintains h/c across frames.
+    """
+    def __init__(self, onnx_path: str, sr: int):
+        self.sr = int(sr)
+        self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        self.in_map, self.out_map = self._discover_io(self.sess)
+
+        # Initialize h, c zeros using input shapes (or output shapes if inputs are dynamic)
+        self.h = self._zeros_like_input(self.in_map["h"])
+        self.c = self._zeros_like_input(self.in_map["c"])
+
+    def _discover_io(self, sess):
+        # Classify inputs
+        in_audio = None
+        in_sr = None
+        in_h = None
+        in_c = None
+
+        # Helper to get rank safely
+        def rank(i): 
+            shp = i.shape
+            try:
+                return len(shp) if shp is not None else None
+            except Exception:
+                return None
+
+        inputs = sess.get_inputs()
+        # First pass: by dtype
+        for i in inputs:
+            if i.type.startswith("tensor(int"):
+                in_sr = i
+            else:
+                # float inputs: could be audio or states
+                name = i.name.lower()
+                r = rank(i)
+                # Name‑based preference
+                if in_audio is None and ("input" in name or name == "x" or "audio" in name):
+                    in_audio = i
+                elif in_h is None and ("h" in name):
+                    in_h = i
+                elif in_c is None and ("c" in name):
+                    in_c = i
+
+        # Second pass: by shape/rank heuristics for anything missing
+        float_inputs = [i for i in inputs if not i.type.startswith("tensor(int"))]
+        if in_audio is None:
+            # pick a float input with rank 2 as audio (1, N) is common
+            cand = [i for i in float_inputs if rank(i) == 2]
+            in_audio = cand[0] if cand else (float_inputs[0] if float_inputs else None)
+        # States: prefer rank 3 (e.g., (2,1,64)); else whatever remains
+        remaining = [i for i in float_inputs if i is not in {in_audio}]
+        if in_h is None and remaining:
+            cand = [i for i in remaining if "h" in i.name.lower()] or [i for i in remaining if rank(i) == 3]
+            in_h = cand[0] if cand else remaining[0]
+            remaining = [i for i in remaining if i is not in {in_h}]
+        if in_c is None and remaining:
+            cand = [i for i in remaining if "c" in i.name.lower()] or [i for i in remaining if rank(i) == 3]
+            in_c = cand[0] if cand else remaining[0]
+
+        if not (in_audio and in_sr and in_h and in_c):
+            names = [i.name for i in inputs]
+            raise RuntimeError(f"Could not map VAD inputs; model inputs: {names}")
+
+        # Classify outputs
+        outputs = sess.get_outputs()
+        out_prob = None
+        out_hn = None
+        out_cn = None
+        for o in outputs:
+            nm = o.name.lower()
+            if out_prob is None and ("out" in nm or nm in ("y", "prob", "output")):
+                out_prob = o
+            elif out_hn is None and ("hn" in nm or nm == "h" or "h1" in nm):
+                out_hn = o
+            elif out_cn is None and ("cn" in nm or nm == "c" or "c1" in nm):
+                out_cn = o
+        # Fallback: pick by rank (prob scalar → rank 0/1; states → rank ≥2)
+        if out_prob is None:
+            scalars = [o for o in outputs if o.shape in ([], [1]) or (len(o.shape or []) <= 1)]
+            out_prob = scalars[0] if scalars else outputs[0]
+        state_like = [o for o in outputs if o is not out_prob]
+        if out_hn is None and state_like:
+            out_hn = state_like[0]
+        if out_cn is None and len(state_like) > 1:
+            out_cn = state_like[1]
+
+        # Report mapping
+        print(f"VAD ONNX inputs mapped: audio='{in_audio.name}', h='{in_h.name}', c='{in_c.name}', sr='{in_sr.name}'")
+        print(f"VAD ONNX outputs mapped: prob='{out_prob.name}', hn='{out_hn.name}', cn='{out_cn.name}'")
+
+        in_map = {"audio": in_audio, "h": in_h, "c": in_c, "sr": in_sr}
+        out_map = {"prob": out_prob, "hn": out_hn, "cn": out_cn}
+        return in_map, out_map
+
+    def _zeros_like_input(self, meta):
+        # Try to use input shape; if dynamic, try output shape; else default to (2,1,64)
+        shp = meta.shape
+        def to_int(x): 
+            try: 
+                return int(x)
+            except Exception:
+                return None
+        if shp and all(to_int(d) is not None for d in shp):
+            shape = tuple(int(d) for d in shp)
+        else:
+            # Try outputs (hn/cn) to get concrete shapes
+            outs = self.sess.get_outputs()
+            for o in outs:
+                nm = o.name.lower()
+                if ("hn" in nm or nm == "h" or "h1" in nm or "cn" in nm or nm == "c" or "c1" in nm):
+                    s = o.shape
+                    if s and all(to_int(d) is not None for d in s):
+                        shape = tuple(int(d) for d in s)
+                        break
+            else:
+                # Reasonable default for Silero (2 layers, batch 1, hidden 64)
+                shape = (2, 1, 64)
+        return np.zeros(shape, dtype=np.float32)
+
+    def forward(self, audio_16k: np.ndarray) -> float:
+        """
+        audio_16k: (N, 1) float32 at 16k
+        Returns probability; updates self.h/self.c with recurrent states.
+        """
+        x = audio_16k.reshape(1, -1).astype(np.float32)
+        sr = np.array([self.sr], dtype=np.int64)
+        feed = {
+            self.in_map["audio"].name: x,
+            self.in_map["h"].name: self.h,
+            self.in_map["c"].name: self.c,
+            self.in_map["sr"].name: sr
+        }
+        outs = self.sess.run(None, feed)
+        # Match outs to names
+        # We’ll find by index matching to out_map order
+        names = [o.name for o in self.sess.get_outputs()]
+        # Build name->value map
+        name2val = {names[i]: outs[i] for i in range(len(names))}
+        prob = float(np.squeeze(name2val[self.out_map["prob"].name]))
+        self.h = name2val[self.out_map["hn"].name]
+        self.c = name2val[self.out_map["cn"].name]
+        return prob
+
+# ------------- Resampler & device helpers -------------
 
 def linear_resample(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     """Simple linear resampler. x shape: (N, C)."""
@@ -179,7 +305,8 @@ def choose_loop_device(loop_ids):
 # ----------------- MAIN -----------------
 
 def main():
-    print("🛡️ Conversation Mode – sample-rate safe build (mic=2, loop=3→4 fallback)")
+    print("🛡️ Conversation Mode – sample-rate safe + stateful VAD (mic=2, loop=3→4 fallback)")
+
     # Mic
     mic_dev = sd.query_devices(MIC_ID)
     mic_rate = nearest_working_samplerate(MIC_ID, PREFERRED_OPEN_RATE, channels=1)
@@ -194,9 +321,8 @@ def main():
     mixer = init_mixer()
     set_volume(mixer, NORMAL_VOLUME)
 
-    # ONNX VAD
-    session, in_name, sr_name = build_vad_session(ONNX_PATH)
-    print(f"VAD ONNX inputs: audio='{in_name}', sr='{sr_name}'  | provider=CPU")
+    # ONNX VAD (STATEFUL)
+    vad = SileroVADStateful(ONNX_PATH, VAD_SAMPLE_RATE)
 
     # Frame math: gather enough native samples to make one 16k VAD frame
     vad_hop_16k = VAD_FRAME_16K
@@ -261,8 +387,8 @@ def main():
                 clean_16k = mic_frame_16k - 0.7 * delayed
                 clean_16k = np.clip(clean_16k, -1.0, 1.0)
 
-                # --- VAD ---
-                prob = get_vad_prob(session, in_name, sr_name, clean_16k)
+                # --- VAD (STATEFUL) ---
+                prob = vad.forward(clean_16k)
 
                 # --- Ducking logic ---
                 now = time.time()
@@ -282,9 +408,11 @@ def main():
     except Exception as e:
         print(f"\nCRITICAL ERROR: {e}")
         print("Tips:")
-        print("  • If you see 'Invalid number of channels', your loopback may be mono; code already limits to 1–2 ch.")
-        print("  • If streams fail on loopback #3, the script will try #4 automatically.")
-        print("  • Ensure 'silero_vad.onnx' is present and compatible (expects inputs: audio, sr).")
+        print("  • Your model seems stateful (x/h/c/sr). This script now feeds and rolls states each frame.")
+        print("  • If you see 'Invalid number of channels', your loopback may be mono; the code already limits to 1–2 ch.")
+        print("  • If streams fail on loopback #3, the script tries #4 automatically.")
+        print("  • Ensure 'silero_vad.onnx' is the same stateful model you pulled.")
+        raise
 
 if __name__ == "__main__":
     main()
