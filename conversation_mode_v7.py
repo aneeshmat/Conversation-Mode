@@ -9,7 +9,7 @@ import numpy as np
 import sounddevice as sd
 import onnxruntime as ort
 
-# Suppress ONNX logging for a cleaner console
+# Suppress ONNX and ALSA junk for a cleaner console
 os.environ["ORT_LOGGING_LEVEL"] = "3"
 
 # ----------------- CONFIGURATION -----------------
@@ -17,10 +17,10 @@ ONNX_PATH = "silero_vad.onnx"
 VAD_SAMPLE_RATE = 16000
 VAD_FRAME_16K = 512
 MIC_ID = 2
-LOOP_IDS = [3, 4]  # Loopback device candidates
+LOOP_IDS = [3, 4] 
 
 app = Flask(__name__)
-# threading mode is more stable for the Pi 3A than eventlet/gevent
+# threading mode is critical for stability on the Pi 3A
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 class AppState:
@@ -42,21 +42,20 @@ state = AppState()
 
 class SileroVADStateful:
     def __init__(self, path):
-        # Memory Optimization: Restrict threads to prevent malloc/Aborted errors
+        # Optimization: Restrict threads to prevent malloc/Aborted errors
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 1
         opts.inter_op_num_threads = 1
         
         self.sess = ort.InferenceSession(path, sess_options=opts, providers=["CPUExecutionProvider"])
         
-        # Map input names dynamically based on the ONNX model version
         inputs = {i.name: i for i in self.sess.get_inputs()}
         self.name_x = next((n for n in inputs if any(s in n.lower() for s in ["audio", "input", "x"])), "x")
         self.name_sr = next((n for n in inputs if "sr" in n.lower()), None)
         self.name_h = next((n for n in inputs if "h" in n.lower() and "n" not in n.lower()), "h")
         self.name_c = next((n for n in inputs if "c" in n.lower() and "n" not in n.lower()), "c")
         
-        # Initialize RNN states (Hidden and Cell states)
+        # Initialize RNN states (Hidden and Cell states) - REQUIRED for Silero
         self.h = np.zeros((2, 1, 64), dtype=np.float32)
         self.c = np.zeros((2, 1, 64), dtype=np.float32)
 
@@ -71,11 +70,11 @@ class SileroVADStateful:
         
         outs = self.sess.run(None, feed)
         
-        # Update internal states for the next frame to maintain continuity
+        # Update internal states for the next frame
         self.h = outs[1]
         self.c = outs[2]
         
-        # Extract probability safely to avoid NumPy deprecation warnings
+        # Extract prob safely to avoid NumPy deprecation warnings
         prob_val = outs[0]
         return float(prob_val.flatten()[0])
 
@@ -109,7 +108,7 @@ def audio_loop():
     loop_history = deque(maxlen=40)
     last_speech = 0.0
 
-    print(f"✅ Audio Processing Started. Access GUI at http://{subprocess.check_output(['hostname', '-I']).decode().split()[0]}:5000")
+    print(f"🚀 Audio Started. Mic {MIC_ID} | Loop {loop_id}")
 
     try:
         with sd.InputStream(device=MIC_ID, channels=1, samplerate=SAMPLING_RATE, blocksize=native_hop) as m_in, \
@@ -119,13 +118,13 @@ def audio_loop():
                 m_chunk, _ = m_in.read(native_hop)
                 l_chunk, _ = l_in.read(native_hop)
                 
-                # Resample chunks to 16kHz for VAD
+                # Resample chunks for VAD
                 m16 = np.interp(np.linspace(0,1,512), np.linspace(0,1,native_hop), m_chunk[:,0]).astype(np.float32)
                 l16 = np.interp(np.linspace(0,1,512), np.linspace(0,1,native_hop), l_chunk[:,0]).astype(np.float32)
                 
                 loop_history.append(l16)
 
-                # Echo Cancellation Logic
+                # AEC Logic
                 if len(loop_history) >= state.aec_delay:
                     ref = list(loop_history)[-int(state.aec_delay)]
                     clean = np.clip(m16 - (state.aec_strength * ref), -1.0, 1.0)
@@ -134,10 +133,9 @@ def audio_loop():
 
                 state.prob = vad.forward(clean)
                 
-                # Broadcast status to Web GUI
-                socketio.emit('stat', {'prob': round(state.prob, 2), 'ducked': state.ducked})
+                # Emit to Web GUI
+                socketio.emit('stat', {'prob': round(state.prob, 2), 'ducked': state.ducked}, namespace='/')
 
-                # Ducking Logic
                 if state.enabled:
                     if state.prob > state.vad_threshold:
                         if not state.ducked:
@@ -148,7 +146,6 @@ def audio_loop():
                         set_volume(state.norm_vol)
                         state.ducked = False
                 elif state.ducked:
-                    # Reset volume if ducking was active when system was disabled
                     set_volume(state.norm_vol)
                     state.ducked = False
 
@@ -213,12 +210,9 @@ def index():
 
 @socketio.on('update')
 def handle_update(data):
-    key = data['key']
     val = float(data['val']) if '.' in str(data['val']) else int(data['val'])
-    setattr(state, key, val)
+    setattr(state, data['key'], val)
 
 if __name__ == '__main__':
-    # Start audio processing in a background thread
     threading.Thread(target=audio_loop, daemon=True).start()
-    # Run the web server
     socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
