@@ -43,23 +43,17 @@ def nearest_working_samplerate(dev_index: int, desired: int, channels: int = 1) 
         except Exception: continue
     raise RuntimeError(f"No workable samplerate for device #{dev_index}")
 
-def init_mixer():
+def set_volume(vol_percent: int):
+    """
+    Directly targets the Bluetooth Speaker (Willen) via PulseAudio.
+    Since pactl set-sink-volume @DEFAULT_SINK@ works, we use it here.
+    """
     try:
-        cards = alsaaudio.cards()
-        for ci, _ in enumerate(cards):
-            ctrls = alsaaudio.mixers(ci)
-            for ctrl in ("PCM", "Master", "Speaker"):
-                if ctrl in ctrls: return alsaaudio.Mixer(control=ctrl, cardindex=ci)
-    except Exception: pass
-    return None
-
-def set_volume(mixer, vol_percent: int):
-    if mixer:
-        try: mixer.setvolume(int(vol_percent))
-        except: pass
-    elif shutil.which("wpctl"):
-        scalar = max(0.0, min(1.0, vol_percent / 100.0))
-        subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{scalar:.2f}"], capture_output=True)
+        # Construct the command exactly as tested in your terminal
+        cmd = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(vol_percent)}%"]
+        subprocess.run(cmd, check=True, capture_output=True)
+    except Exception as e:
+        print(f"⚠️ Volume Control Error: {e}")
 
 # -------- Silero VAD (stateful) session wrapper --------
 
@@ -67,30 +61,19 @@ class SileroVADStateful:
     def __init__(self, onnx_path: str, sr: int):
         self.sr = int(sr)
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-        
-        # 1. INSPECT MODEL
         self.input_names = [i.name for i in self.sess.get_inputs()]
         self.output_names = [o.name for o in self.sess.get_outputs()]
-        print(f"DEBUG: Model Inputs expected: {self.input_names}")
-        print(f"DEBUG: Model Outputs expected: {self.output_names}")
 
-        # 2. ROBUST MAPPING
-        try:
-            self.name_audio = next(n for n in self.input_names if any(x in n.lower() for x in ["input", "x", "audio"]))
-            # SR is optional in some newer versions; handle if missing
-            self.name_sr = next((n for n in self.input_names if any(x in n.lower() for x in ["sr", "sample_rate"])), None)
-            self.name_h = next(n for n in self.input_names if "h" in n.lower())
-            self.name_c = next(n for n in self.input_names if "c" in n.lower())
-            
-            self.name_prob = next(n for n in self.output_names if any(x in n.lower() for x in ["prob", "output", "y"]))
-            self.name_hn = next(n for n in self.output_names if "h" in n.lower() and n != self.name_h)
-            self.name_cn = next(n for n in self.output_names if "c" in n.lower() and n != self.name_c)
-        except StopIteration as e:
-            print(f"\nCRITICAL ERROR: Mapping failed. Model inputs are {self.input_names}")
-            print("Please ensure your 'silero_vad.onnx' is a stateful model.")
-            raise e
+        # Dynamic name mapping for Silero
+        self.name_audio = next(n for n in self.input_names if any(x in n.lower() for x in ["input", "x", "audio"]))
+        self.name_sr = next((n for n in self.input_names if any(x in n.lower() for x in ["sr", "sample_rate"])), None)
+        self.name_h = next(n for n in self.input_names if "h" in n.lower())
+        self.name_c = next(n for n in self.input_names if "c" in n.lower())
+        
+        self.name_prob = next(n for n in self.output_names if any(x in n.lower() for x in ["prob", "output", "y"]))
+        self.name_hn = next(n for n in self.output_names if "h" in n.lower() and n != self.name_h)
+        self.name_cn = next(n for n in self.output_names if "c" in n.lower() and n != self.name_c)
 
-        # 3. INITIALIZE STATES (Silero standard: 2 layers, batch 1, 64 hidden)
         self.h = np.zeros((2, 1, 64), dtype=np.float32)
         self.c = np.zeros((2, 1, 64), dtype=np.float32)
 
@@ -100,13 +83,11 @@ class SileroVADStateful:
             self.name_h: self.h,
             self.name_c: self.c
         }
-        # Only add SR if the model expects it
         if self.name_sr:
             feed[self.name_sr] = np.array([self.sr], dtype=np.int64)
         
         outs = self.sess.run(None, feed)
         name2val = {self.output_names[i]: outs[i] for i in range(len(self.output_names))}
-        
         self.h = name2val[self.name_hn]
         self.c = name2val[self.name_cn]
         return float(np.squeeze(name2val[self.name_prob]))
@@ -116,16 +97,16 @@ def linear_resample(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     n_dst = int(round(len(x) * (dst_sr / src_sr)))
     t_src = np.linspace(0, 1, len(x), endpoint=False)
     t_dst = np.linspace(0, 1, n_dst, endpoint=False)
-    # Ensure result is reshaped to (Samples, 1)
     return np.interp(t_dst, t_src, x[:, 0]).reshape(-1, 1).astype(np.float32)
 
 # ----------------- MAIN -----------------
 
 def main():
-    print("🛡️ Conversation Mode - Starting...")
+    print("🛡️ Bluetooth Relay Conversation Mode - Starting...")
+    
+    # 1. Setup Audio Devices
     mic_rate = nearest_working_samplerate(MIC_ID, PREFERRED_OPEN_RATE, 1)
     
-    # Selection of loopback device
     loop_id, loop_ch, loop_rate = 3, 2, 48000
     for lid in LOOP_IDS:
         try:
@@ -136,8 +117,8 @@ def main():
             break
         except: continue
 
-    mixer = init_mixer()
-    set_volume(mixer, NORMAL_VOLUME)
+    # 2. Init Model & Set Initial Volume
+    set_volume(NORMAL_VOLUME)
     vad = SileroVADStateful(ONNX_PATH, VAD_SAMPLE_RATE)
 
     vad_hop_16k = VAD_FRAME_16K
@@ -148,37 +129,45 @@ def main():
     ducked = False
     last_speech = 0.0
 
-    print(f"🚀 Processing: Mic({mic_rate}Hz), Loop({loop_rate}Hz)")
+    print(f"🚀 Processing Active: Mic({mic_rate}Hz), Loopback({loop_rate}Hz)")
 
     try:
         with sd.InputStream(device=MIC_ID, channels=1, samplerate=mic_rate, blocksize=mic_hop_native) as m_in, \
              sd.InputStream(device=loop_id, channels=loop_ch, samplerate=loop_rate, blocksize=loop_hop_native) as l_in:
+            
             while True:
                 mic_chunk, _ = m_in.read(mic_hop_native)
                 loop_chunk_m, _ = l_in.read(loop_hop_native)
                 
+                # Resample both to 16kHz for the VAD model
                 mic_16k = linear_resample(mic_chunk, mic_rate, VAD_SAMPLE_RATE)
                 loop_16k = linear_resample(loop_chunk_m[:, 0:1], loop_rate, VAD_SAMPLE_RATE)
 
+                # Store loopback for Echo Cancellation
                 loop_history.append(loop_16k)
                 delayed = loop_history[0] if len(loop_history) > AEC_DELAY_FRAMES_16K else np.zeros_like(mic_16k)
                 
+                # Remove loopback (music) from mic signal
                 clean = np.clip(mic_16k - 0.7 * delayed, -1.0, 1.0)
+                
+                # Check for speech
                 prob = vad.forward(clean)
                 now = time.time()
 
                 if prob > VAD_THRESHOLD:
                     if not ducked:
-                        print(f"🎤 Speech ({int(prob*100)}%) -> Ducking")
-                        set_volume(mixer, DUCK_VOLUME)
+                        print(f"🎤 Speech Detected ({int(prob*100)}%) -> Ducking Willen Speaker")
+                        set_volume(DUCK_VOLUME)
                         ducked = True
                     last_speech = now
                 elif ducked and (now - last_speech > UNDUCK_AFTER_SEC):
-                    print("🔇 Silence -> Restoring")
-                    set_volume(mixer, NORMAL_VOLUME)
+                    print("🔇 Silence Detected -> Restoring Music Volume")
+                    set_volume(NORMAL_VOLUME)
                     ducked = False
+
     except KeyboardInterrupt:
-        print("\n👋 Stopped.")
+        print("\n👋 Stopped. Restoring normal volume...")
+        set_volume(NORMAL_VOLUME)
 
 if __name__ == "__main__":
     main()
