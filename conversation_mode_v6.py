@@ -7,7 +7,6 @@ from collections import deque
 
 import numpy as np
 import sounddevice as sd
-import alsaaudio
 import onnxruntime as ort
 
 os.environ["ORT_LOGGING_LEVEL"] = "3"
@@ -21,9 +20,14 @@ VAD_SAMPLE_RATE = 16000
 VAD_FRAME_16K = 512
 PREFERRED_OPEN_RATE = 48000
 
-AEC_DELAY_FRAMES_16K = 3
-VAD_THRESHOLD = 0.65
-UNDUCK_AFTER_SEC = 2.5
+# --- AEC TUNING ---
+# Bluetooth delay is huge. 1 frame = 32ms. 
+# Try values between 10 and 20 (320ms - 640ms)
+AEC_DELAY_FRAMES_16K = 12 
+AEC_STRENGTH = 0.85      # 1.0 is total subtraction, 0.7 is partial
+
+VAD_THRESHOLD = 0.70     # Higher = less sensitive to background noise
+UNDUCK_AFTER_SEC = 2.0
 DUCK_VOLUME = 20
 NORMAL_VOLUME = 80
 
@@ -31,29 +35,21 @@ NORMAL_VOLUME = 80
 
 def nearest_working_samplerate(dev_index: int, desired: int, channels: int = 1) -> int:
     dev = sd.query_devices(dev_index)
-    candidates = [int(desired)] if desired else []
-    for r in (48000, 44100, 32000, 16000):
-        if r not in candidates: candidates.append(r)
+    candidates = [int(desired), 48000, 44100, 16000]
     for rate in candidates:
         try:
             sd.check_input_settings(device=dev_index, samplerate=rate, channels=channels)
             return rate
-        except Exception: continue
-    raise RuntimeError(f"No workable samplerate for device #{dev_index}")
+        except: continue
+    raise RuntimeError(f"No workable rate for device #{dev_index}")
 
 def set_volume(vol_percent: int):
-    """
-    Directly targets the Bluetooth Speaker (Willen) via PulseAudio.
-    Since pactl set-sink-volume @DEFAULT_SINK@ works, we use it here.
-    """
     try:
-        # Construct the command exactly as tested in your terminal
-        cmd = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(vol_percent)}%"]
-        subprocess.run(cmd, check=True, capture_output=True)
-    except Exception as e:
-        print(f"⚠️ Volume Control Error: {e}")
+        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(vol_percent)}%"],
+                       check=True, capture_output=True)
+    except: pass
 
-# -------- Silero VAD (stateful) session wrapper --------
+# -------- Silero VAD (stateful) --------
 
 class SileroVADStateful:
     def __init__(self, onnx_path: str, sr: int):
@@ -62,7 +58,6 @@ class SileroVADStateful:
         self.input_names = [i.name for i in self.sess.get_inputs()]
         self.output_names = [o.name for o in self.sess.get_outputs()]
 
-        # Dynamic name mapping for Silero
         self.name_audio = next(n for n in self.input_names if any(x in n.lower() for x in ["input", "x", "audio"]))
         self.name_sr = next((n for n in self.input_names if any(x in n.lower() for x in ["sr", "sample_rate"])), None)
         self.name_h = next(n for n in self.input_names if "h" in n.lower())
@@ -100,12 +95,13 @@ def linear_resample(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
 # ----------------- MAIN -----------------
 
 def main():
-    print("🛡️ Bluetooth Relay Conversation Mode - Starting...")
+    print("🛡️ AEC-Tuned Bluetooth Relay Mode - Starting...")
     
-    # 1. Setup Audio Devices
     mic_rate = nearest_working_samplerate(MIC_ID, PREFERRED_OPEN_RATE, 1)
     
-    loop_id, loop_ch, loop_rate = 3, 2, 48000
+    loop_id = 3
+    loop_ch = 2
+    loop_rate = 48000
     for lid in LOOP_IDS:
         try:
             dev = sd.query_devices(lid)
@@ -115,7 +111,6 @@ def main():
             break
         except: continue
 
-    # 2. Init Model & Set Initial Volume
     set_volume(NORMAL_VOLUME)
     vad = SileroVADStateful(ONNX_PATH, VAD_SAMPLE_RATE)
 
@@ -123,11 +118,12 @@ def main():
     mic_hop_native = int(round(vad_hop_16k * (mic_rate / VAD_SAMPLE_RATE)))
     loop_hop_native = int(round(vad_hop_16k * (loop_rate / VAD_SAMPLE_RATE)))
     
-    loop_history = deque(maxlen=AEC_DELAY_FRAMES_16K + 5)
+    # Large buffer to handle Bluetooth latency
+    loop_history = deque(maxlen=AEC_DELAY_FRAMES_16K + 2)
     ducked = False
     last_speech = 0.0
 
-    print(f"🚀 Processing Active: Mic({mic_rate}Hz), Loopback({loop_rate}Hz)")
+    print(f"🚀 AEC Calibrated: Delay={AEC_DELAY_FRAMES_16K} frames (~{AEC_DELAY_FRAMES_16K*32}ms)")
 
     try:
         with sd.InputStream(device=MIC_ID, channels=1, samplerate=mic_rate, blocksize=mic_hop_native) as m_in, \
@@ -137,34 +133,35 @@ def main():
                 mic_chunk, _ = m_in.read(mic_hop_native)
                 loop_chunk_m, _ = l_in.read(loop_hop_native)
                 
-                # Resample both to 16kHz for the VAD model
                 mic_16k = linear_resample(mic_chunk, mic_rate, VAD_SAMPLE_RATE)
                 loop_16k = linear_resample(loop_chunk_m[:, 0:1], loop_rate, VAD_SAMPLE_RATE)
 
-                # Store loopback for Echo Cancellation
                 loop_history.append(loop_16k)
-                delayed = loop_history[0] if len(loop_history) > AEC_DELAY_FRAMES_16K else np.zeros_like(mic_16k)
                 
-                # Remove loopback (music) from mic signal
-                clean = np.clip(mic_16k - 0.7 * delayed, -1.0, 1.0)
+                # Wait until the history buffer is full before trying to cancel
+                if len(loop_history) >= AEC_DELAY_FRAMES_16K:
+                    delayed_reference = loop_history[0]
+                    # Subtract music from microphone signal
+                    clean = mic_16k - (AEC_STRENGTH * delayed_reference)
+                    clean = np.clip(clean, -1.0, 1.0)
+                else:
+                    clean = mic_16k
                 
-                # Check for speech
                 prob = vad.forward(clean)
                 now = time.time()
 
                 if prob > VAD_THRESHOLD:
                     if not ducked:
-                        print(f"🎤 Speech Detected ({int(prob*100)}%) -> Ducking Willen Speaker")
+                        print(f"🎤 Speech ({int(prob*100)}%) -> Ducking")
                         set_volume(DUCK_VOLUME)
                         ducked = True
                     last_speech = now
                 elif ducked and (now - last_speech > UNDUCK_AFTER_SEC):
-                    print("🔇 Silence Detected -> Restoring Music Volume")
+                    print("🔇 Silence -> Restoring")
                     set_volume(NORMAL_VOLUME)
                     ducked = False
 
     except KeyboardInterrupt:
-        print("\n👋 Stopped. Restoring normal volume...")
         set_volume(NORMAL_VOLUME)
 
 if __name__ == "__main__":
