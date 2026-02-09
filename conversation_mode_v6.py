@@ -68,31 +68,41 @@ class SileroVADStateful:
         self.sr = int(sr)
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         
-        # Get actual names from the model to avoid "Invalid input name"
+        # 1. INSPECT MODEL
         self.input_names = [i.name for i in self.sess.get_inputs()]
         self.output_names = [o.name for o in self.sess.get_outputs()]
-        
-        # Identify specific inputs by looking at their strings
-        self.name_audio = next(n for n in self.input_names if any(x in n.lower() for x in ["input", "x", "audio"]))
-        self.name_sr = next(n for n in self.input_names if any(x in n.lower() for x in ["sr", "sample_rate"]))
-        self.name_h = next(n for n in self.input_names if "h" in n.lower())
-        self.name_c = next(n for n in self.input_names if "c" in n.lower())
-        
-        self.name_prob = next(n for n in self.output_names if any(x in n.lower() for x in ["prob", "output", "y"]))
-        self.name_hn = next(n for n in self.output_names if "h" in n.lower() and n != self.name_h)
-        self.name_cn = next(n for n in self.output_names if "c" in n.lower() and n != self.name_c)
+        print(f"DEBUG: Model Inputs expected: {self.input_names}")
+        print(f"DEBUG: Model Outputs expected: {self.output_names}")
 
-        # Init states
+        # 2. ROBUST MAPPING
+        try:
+            self.name_audio = next(n for n in self.input_names if any(x in n.lower() for x in ["input", "x", "audio"]))
+            # SR is optional in some newer versions; handle if missing
+            self.name_sr = next((n for n in self.input_names if any(x in n.lower() for x in ["sr", "sample_rate"])), None)
+            self.name_h = next(n for n in self.input_names if "h" in n.lower())
+            self.name_c = next(n for n in self.input_names if "c" in n.lower())
+            
+            self.name_prob = next(n for n in self.output_names if any(x in n.lower() for x in ["prob", "output", "y"]))
+            self.name_hn = next(n for n in self.output_names if "h" in n.lower() and n != self.name_h)
+            self.name_cn = next(n for n in self.output_names if "c" in n.lower() and n != self.name_c)
+        except StopIteration as e:
+            print(f"\nCRITICAL ERROR: Mapping failed. Model inputs are {self.input_names}")
+            print("Please ensure your 'silero_vad.onnx' is a stateful model.")
+            raise e
+
+        # 3. INITIALIZE STATES (Silero standard: 2 layers, batch 1, 64 hidden)
         self.h = np.zeros((2, 1, 64), dtype=np.float32)
         self.c = np.zeros((2, 1, 64), dtype=np.float32)
 
     def forward(self, audio_16k: np.ndarray) -> float:
         feed = {
             self.name_audio: audio_16k.reshape(1, -1).astype(np.float32),
-            self.name_sr: np.array([self.sr], dtype=np.int64),
             self.name_h: self.h,
             self.name_c: self.c
         }
+        # Only add SR if the model expects it
+        if self.name_sr:
+            feed[self.name_sr] = np.array([self.sr], dtype=np.int64)
         
         outs = self.sess.run(None, feed)
         name2val = {self.output_names[i]: outs[i] for i in range(len(self.output_names))}
@@ -106,6 +116,7 @@ def linear_resample(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     n_dst = int(round(len(x) * (dst_sr / src_sr)))
     t_src = np.linspace(0, 1, len(x), endpoint=False)
     t_dst = np.linspace(0, 1, n_dst, endpoint=False)
+    # Ensure result is reshaped to (Samples, 1)
     return np.interp(t_dst, t_src, x[:, 0]).reshape(-1, 1).astype(np.float32)
 
 # ----------------- MAIN -----------------
@@ -114,7 +125,7 @@ def main():
     print("🛡️ Conversation Mode - Starting...")
     mic_rate = nearest_working_samplerate(MIC_ID, PREFERRED_OPEN_RATE, 1)
     
-    # Try loopback IDs
+    # Selection of loopback device
     loop_id, loop_ch, loop_rate = 3, 2, 48000
     for lid in LOOP_IDS:
         try:
