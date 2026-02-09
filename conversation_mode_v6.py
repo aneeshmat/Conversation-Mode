@@ -3,7 +3,8 @@
 
 """
 Conversation Mode with Silero VAD (stateful ONNX)
-- Optimized for stability and sample-rate safety.
+- Handles stateful Silero VAD: inputs (x, h, c, sr) and outputs (prob, hn, cn)
+- Fixes the 'NoneType' object has no attribute 'name' error by improving IO discovery.
 """
 
 import os
@@ -22,11 +23,11 @@ os.environ["ORT_LOGGING_LEVEL"] = "3"
 
 # ----------------- USER SETTINGS -----------------
 MIC_ID = 2
-LOOP_IDS = [3, 4] 
+LOOP_IDS = [3, 4]       # try 3; if it fails, try 4
 ONNX_PATH = "silero_vad.onnx"
 
 VAD_SAMPLE_RATE = 16000
-VAD_FRAME_16K = 512 
+VAD_FRAME_16K = 512              # ~32 ms frames
 PREFERRED_OPEN_RATE = 48000
 
 AEC_DELAY_FRAMES_16K = 3
@@ -80,15 +81,7 @@ def set_volume(mixer, vol_percent: int):
         try:
             scalar = max(0.0, min(1.0, vol_percent / 100.0))
             subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{scalar:.2f}"],
-                           check=False, capture_output=True)
-            return
-        except Exception:
-            pass
-
-    if shutil.which("pactl"):
-        try:
-            subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(vol_percent)}%"],
-                           check=False, capture_output=True)
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
         except Exception:
             pass
@@ -100,6 +93,8 @@ class SileroVADStateful:
         self.sr = int(sr)
         self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         self.in_map, self.out_map = self._discover_io(self.sess)
+        
+        # Initialize h, c zeros
         self.h = self._zeros_like_input(self.in_map["h"])
         self.c = self._zeros_like_input(self.in_map["c"])
 
@@ -109,37 +104,60 @@ class SileroVADStateful:
         
         for i in inputs:
             nm = i.name.lower()
-            if i.type.startswith("tensor(int"): in_sr = i
-            elif any(x in nm for x in ["input", "x", "audio"]): in_audio = i
-            elif "h" in nm: in_h = i
-            elif "c" in nm: in_c = i
+            # Match SR by type or common names
+            if "sr" in nm or "sample_rate" in nm or i.type.startswith("tensor(int"):
+                in_sr = i
+            elif any(x in nm for x in ["input", "x", "audio"]):
+                in_audio = i
+            elif "h" in nm:
+                in_h = i
+            elif "c" in nm:
+                in_c = i
+
+        # Fallback for critical SR input if naming discovery failed
+        if in_sr is None:
+            class Dummy: pass
+            in_sr = Dummy(); in_sr.name = "sr"
 
         outputs = sess.get_outputs()
         out_prob = out_hn = out_cn = None
         for o in outputs:
             nm = o.name.lower()
-            if any(x in nm for x in ["prob", "output", "y"]): out_prob = o
-            elif any(x in nm for x in ["hn", "h1"]) or nm == "h": out_hn = o
-            elif any(x in nm for x in ["cn", "c1"]) or nm == "c": out_cn = o
+            if any(x in nm for x in ["prob", "output", "y"]):
+                out_prob = o
+            elif any(x in nm for x in ["hn", "h1"]) or nm == "h":
+                out_hn = o
+            elif any(x in nm for x in ["cn", "c1"]) or nm == "c":
+                out_cn = o
+
+        # Verify essential mappings
+        if not in_audio or not out_prob:
+            raise RuntimeError(f"Failed to map essential ONNX IO. Inputs found: {[i.name for i in inputs]}")
 
         return {"audio": in_audio, "h": in_h, "c": in_c, "sr": in_sr}, \
                {"prob": out_prob, "hn": out_hn, "cn": out_cn}
 
     def _zeros_like_input(self, meta):
-        shp = meta.shape
-        if shp and all(isinstance(d, int) for d in shp):
-            return np.zeros(tuple(shp), dtype=np.float32)
+        # Silero standard: (2, 1, 64)
+        try:
+            shp = meta.shape
+            if shp and all(isinstance(d, int) for d in shp):
+                return np.zeros(tuple(shp), dtype=np.float32)
+        except:
+            pass
         return np.zeros((2, 1, 64), dtype=np.float32)
 
     def forward(self, audio_16k: np.ndarray) -> float:
         x = audio_16k.reshape(1, -1).astype(np.float32)
         sr = np.array([self.sr], dtype=np.int64)
+        
         feed = {
             self.in_map["audio"].name: x,
             self.in_map["h"].name: self.h,
             self.in_map["c"].name: self.c,
             self.in_map["sr"].name: sr
         }
+        
         outs = self.sess.run(None, feed)
         names = [o.name for o in self.sess.get_outputs()]
         name2val = {names[i]: outs[i] for i in range(len(names))}
@@ -148,6 +166,8 @@ class SileroVADStateful:
         self.h = name2val[self.out_map["hn"].name]
         self.c = name2val[self.out_map["cn"].name]
         return prob
+
+# ------------- Resampler & device helpers -------------
 
 def linear_resample(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     if src_sr == dst_sr or x.size == 0:
@@ -171,11 +191,13 @@ def choose_loop_device(loop_ids):
             return lid, dev, ch, rate
         except Exception:
             continue
-    raise RuntimeError("No loopback device usable.")
+    raise RuntimeError(f"No loopback device usable from {loop_ids}.")
 
 # ----------------- MAIN -----------------
 
 def main():
+    print("🛡️ Conversation Mode – Starting Process...")
+
     mic_rate = nearest_working_samplerate(MIC_ID, PREFERRED_OPEN_RATE, channels=1)
     loop_id, loop_dev, loop_ch, loop_rate = choose_loop_device(LOOP_IDS)
 
@@ -202,57 +224,60 @@ def main():
              sd.InputStream(device=loop_id, channels=loop_ch, samplerate=loop_rate, blocksize=loop_hop_native) as loop_in:
 
             while True:
-                # Use non-blocking checks to prevent hanging
                 mic_chunk, _ = mic_in.read(mic_hop_native)
                 loop_chunk_multi, _ = loop_in.read(loop_hop_native)
 
                 if mic_chunk is None or loop_chunk_multi is None:
                     continue
 
-                # Ensure 2D and handle loopback channels
-                mic_chunk = mic_chunk.reshape(-1, 1).astype(np.float32)
-                loop_chunk = loop_chunk_multi[:, 0:1].astype(np.float32)
+                loop_chunk = loop_chunk_multi[:, 0:1] # use channel 0
 
-                mic_accum = np.vstack((mic_accum, mic_chunk))
-                loop_accum = np.vstack((loop_accum, loop_chunk))
+                mic_accum = np.vstack((mic_accum, mic_chunk.astype(np.float32)))
+                loop_accum = np.vstack((loop_accum, loop_chunk.astype(np.float32)))
 
-                # Process if we have enough to resample
-                if mic_accum.shape[0] >= mic_hop_native and loop_accum.shape[0] >= loop_hop_native:
-                    mic_frame_16k = linear_resample(mic_accum[:mic_hop_native], mic_rate, VAD_SAMPLE_RATE)
-                    loop_frame_16k = linear_resample(loop_accum[:loop_hop_native], loop_rate, VAD_SAMPLE_RATE)
-                    
-                    # Trim accumulators
-                    mic_accum = mic_accum[mic_hop_native:]
-                    loop_accum = loop_accum[loop_hop_native:]
+                # Ensure we have enough resampled data for a VAD frame
+                mic_accum_16k = linear_resample(mic_accum, mic_rate, VAD_SAMPLE_RATE)
+                loop_accum_16k = linear_resample(loop_accum, loop_rate, VAD_SAMPLE_RATE)
 
-                    # --- AEC ---
-                    loop_history_16k.append(loop_frame_16k.copy())
-                    if len(loop_history_16k) > aec_delay_frames:
-                        delayed = loop_history_16k[-(aec_delay_frames + 1)]
-                    else:
-                        delayed = np.zeros_like(loop_frame_16k)
+                if mic_accum_16k.shape[0] < vad_hop_16k:
+                    continue
 
-                    clean_16k = mic_frame_16k - 0.7 * delayed
-                    clean_16k = np.clip(clean_16k, -1.0, 1.0)
+                mic_frame_16k = mic_accum_16k[:vad_hop_16k]
+                loop_frame_16k = loop_accum_16k[:vad_hop_16k]
 
-                    # --- VAD & Ducking ---
-                    prob = vad.forward(clean_16k)
-                    now = time.time()
-                    if prob > VAD_THRESHOLD:
-                        if not ducked:
-                            print(f"🎤 Speech ({int(prob*100)}%) -> Ducking")
-                            set_volume(mixer, DUCK_VOLUME)
-                            ducked = True
-                        last_speech_time = now
-                    elif ducked and (now - last_speech_time > UNDUCK_AFTER_SEC):
-                        print("🔇 Silence -> Restoring")
-                        set_volume(mixer, NORMAL_VOLUME)
-                        ducked = False
+                # Consume native samples
+                mic_accum = mic_accum[mic_hop_native:]
+                loop_accum = loop_accum[loop_hop_native:]
+
+                # --- AEC (Delayed Subtraction) ---
+                loop_history_16k.append(loop_frame_16k.copy())
+                if len(loop_history_16k) > aec_delay_frames:
+                    delayed = loop_history_16k[-(aec_delay_frames + 1)]
+                else:
+                    delayed = np.zeros_like(loop_frame_16k)
+
+                clean_16k = mic_frame_16k - 0.7 * delayed
+                clean_16k = np.clip(clean_16k, -1.0, 1.0)
+
+                # --- VAD ---
+                prob = vad.forward(clean_16k)
+                now = time.time()
+
+                if prob > VAD_THRESHOLD:
+                    if not ducked:
+                        print(f"🎤 Speech ({int(prob*100)}%) -> Ducking")
+                        set_volume(mixer, DUCK_VOLUME)
+                        ducked = True
+                    last_speech_time = now
+                elif ducked and (now - last_speech_time > UNDUCK_AFTER_SEC):
+                    print("🔇 Silence -> Restoring Volume")
+                    set_volume(mixer, NORMAL_VOLUME)
+                    ducked = False
 
     except KeyboardInterrupt:
-        print("\n👋 Stopped.")
+        print("\n👋 Stopped by user.")
     except Exception as e:
-        print(f"\nError: {e}")
+        print(f"\nCRITICAL ERROR: {e}")
         raise
 
 if __name__ == "__main__":
