@@ -9,7 +9,7 @@ import numpy as np
 import sounddevice as sd
 import onnxruntime as ort
 
-# Suppress ONNX and ALSA junk for a cleaner console
+# 1. Clean up logs and suppress warnings
 os.environ["ORT_LOGGING_LEVEL"] = "3"
 
 # ----------------- CONFIGURATION -----------------
@@ -20,7 +20,6 @@ MIC_ID = 2
 LOOP_IDS = [3, 4] 
 
 app = Flask(__name__)
-# threading mode is critical for stability on the Pi 3A
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 class AppState:
@@ -42,20 +41,21 @@ state = AppState()
 
 class SileroVADStateful:
     def __init__(self, path):
-        # Optimization: Restrict threads to prevent malloc/Aborted errors
+        # 2. CRITICAL: Restrict threads to 1 to prevent the 'Aborted' memory crash on Pi 3A
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 1
         opts.inter_op_num_threads = 1
         
         self.sess = ort.InferenceSession(path, sess_options=opts, providers=["CPUExecutionProvider"])
         
+        # 3. FIX: Properly map h and c inputs to satisfy the RNN model requirements
         inputs = {i.name: i for i in self.sess.get_inputs()}
         self.name_x = next((n for n in inputs if any(s in n.lower() for s in ["audio", "input", "x"])), "x")
         self.name_sr = next((n for n in inputs if "sr" in n.lower()), None)
         self.name_h = next((n for n in inputs if "h" in n.lower() and "n" not in n.lower()), "h")
         self.name_c = next((n for n in inputs if "c" in n.lower() and "n" not in n.lower()), "c")
         
-        # Initialize RNN states (Hidden and Cell states) - REQUIRED for Silero
+        # Initialize RNN states with zeros
         self.h = np.zeros((2, 1, 64), dtype=np.float32)
         self.c = np.zeros((2, 1, 64), dtype=np.float32)
 
@@ -70,11 +70,11 @@ class SileroVADStateful:
         
         outs = self.sess.run(None, feed)
         
-        # Update internal states for the next frame
+        # 4. FIX: Update states for the next chunk to maintain continuity
         self.h = outs[1]
         self.c = outs[2]
         
-        # Extract prob safely to avoid NumPy deprecation warnings
+        # 5. FIX: Use flatten()[0] to avoid the NumPy DeprecationWarning spam
         prob_val = outs[0]
         return float(prob_val.flatten()[0])
 
@@ -92,11 +92,8 @@ def audio_loop():
     loop_id = 3
     for lid in LOOP_IDS:
         try:
-            sd.query_devices(lid)
-            loop_id = lid
-            break
-        except:
-            continue
+            sd.query_devices(lid); loop_id = lid; break
+        except: continue
 
     try:
         vad = SileroVADStateful(ONNX_PATH)
@@ -108,7 +105,7 @@ def audio_loop():
     loop_history = deque(maxlen=40)
     last_speech = 0.0
 
-    print(f"🚀 Audio Started. Mic {MIC_ID} | Loop {loop_id}")
+    print(f"🚀 Audio Started. Access GUI at http://10.6.1.47:5000")
 
     try:
         with sd.InputStream(device=MIC_ID, channels=1, samplerate=SAMPLING_RATE, blocksize=native_hop) as m_in, \
@@ -118,13 +115,11 @@ def audio_loop():
                 m_chunk, _ = m_in.read(native_hop)
                 l_chunk, _ = l_in.read(native_hop)
                 
-                # Resample chunks for VAD
                 m16 = np.interp(np.linspace(0,1,512), np.linspace(0,1,native_hop), m_chunk[:,0]).astype(np.float32)
                 l16 = np.interp(np.linspace(0,1,512), np.linspace(0,1,native_hop), l_chunk[:,0]).astype(np.float32)
                 
                 loop_history.append(l16)
 
-                # AEC Logic
                 if len(loop_history) >= state.aec_delay:
                     ref = list(loop_history)[-int(state.aec_delay)]
                     clean = np.clip(m16 - (state.aec_strength * ref), -1.0, 1.0)
@@ -133,8 +128,7 @@ def audio_loop():
 
                 state.prob = vad.forward(clean)
                 
-                # Emit to Web GUI
-                socketio.emit('stat', {'prob': round(state.prob, 2), 'ducked': state.ducked}, namespace='/')
+                socketio.emit('stat', {'prob': round(state.prob, 2), 'ducked': state.ducked})
 
                 if state.enabled:
                     if state.prob > state.vad_threshold:
@@ -145,14 +139,11 @@ def audio_loop():
                     elif state.ducked and (time.time() - last_speech > state.unduck_sec):
                         set_volume(state.norm_vol)
                         state.ducked = False
-                elif state.ducked:
-                    set_volume(state.norm_vol)
-                    state.ducked = False
 
     except Exception as e:
         print(f"❌ Audio Loop Error: {e}")
 
-# ----------------- WEB INTERFACE -----------------
+# ----------------- WEB ROUTES -----------------
 
 @app.route('/')
 def index():
@@ -163,12 +154,11 @@ def index():
         <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
         <style>
             body { font-family: sans-serif; background: #121212; color: white; text-align: center; padding: 20px; }
-            .card { background: #1e1e1e; padding: 20px; border-radius: 15px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+            .card { background: #1e1e1e; padding: 20px; border-radius: 15px; margin-bottom: 20px; }
             input[type=range] { width: 100%; margin: 15px 0; accent-color: #007bff; }
-            #status { font-size: 1.5em; font-weight: bold; padding: 15px; border-radius: 10px; transition: 0.3s; }
+            #status { font-size: 1.5em; font-weight: bold; padding: 15px; border-radius: 10px; }
             .active { background: #d32f2f; } .idle { background: #388e3c; }
             button { padding: 15px; width: 100%; border-radius: 10px; border: none; font-size: 1.1em; font-weight: bold; color: white; cursor: pointer; }
-            .label-group { display: flex; justify-content: space-between; color: #aaa; font-size: 0.9em; }
         </style>
     </head>
     <body>
@@ -180,10 +170,9 @@ def index():
             <button id="toggleBtn" onclick="toggleSystem()" style="background: #d32f2f;">DISABLE DUCKING</button>
         </div>
         <div class="card">
-            <div class="label-group"><span>AEC Delay</span><span id="aec_val">14</span></div>
+            <p>AEC Delay: <span id="aec_val">14</span></p>
             <input type="range" min="1" max="35" step="1" value="14" oninput="update('aec_delay', this.value); document.getElementById('aec_val').innerText=this.value">
-            
-            <div class="label-group"><span>VAD Sensitivity</span><span id="vad_val">0.70</span></div>
+            <p>VAD Sensitivity: <span id="vad_val">0.70</span></p>
             <input type="range" min="0" max="1" step="0.05" value="0.70" oninput="update('vad_threshold', this.value); document.getElementById('vad_val').innerText=this.value">
         </div>
         <script>
