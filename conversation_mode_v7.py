@@ -3,21 +3,22 @@ import time
 import threading
 import subprocess
 from collections import deque
-import tkinter as tk
-from tkinter import ttk
+from flask import Flask, render_template, request
+from flask_socketio import SocketIO
 
 import numpy as np
 import sounddevice as sd
 import onnxruntime as ort
 
-os.environ["ORT_LOGGING_LEVEL"] = "3"
-
-# ----------------- SETTINGS & GLOBALS -----------------
+# --- CONFIG ---
 ONNX_PATH = "silero_vad.onnx"
 VAD_SAMPLE_RATE = 16000
 VAD_FRAME_16K = 512
 MIC_ID = 2
 LOOP_IDS = [3, 4]
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 class AppState:
     def __init__(self):
@@ -25,7 +26,7 @@ class AppState:
         self.enabled = True
         self.ducked = False
         self.prob = 0.0
-        self.aec_delay = 14  # Increased default for BT
+        self.aec_delay = 14
         self.aec_strength = 0.85
         self.vad_threshold = 0.70
         self.duck_vol = 20
@@ -34,145 +35,132 @@ class AppState:
 
 state = AppState()
 
-def set_volume(vol_percent):
+# --- AUDIO PROCESSING ---
+
+def set_volume(vol):
     try:
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(vol_percent)}%"],
-                       check=True, capture_output=True)
+        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(vol)}%"], check=True)
     except: pass
 
 class SileroVADStateful:
-    def __init__(self, onnx_path, sr):
-        self.sr = np.array([sr], dtype=np.int64)
-        self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-        
-        # Defensive Input Mapping
+    def __init__(self, path):
+        self.sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
         inputs = {i.name: i for i in self.sess.get_inputs()}
         self.name_audio = next((n for n in inputs if "audio" in n or "input" in n or "x" in n), None)
         self.name_sr = next((n for n in inputs if "sr" in n or "sample_rate" in n), None)
         self.name_h = next((n for n in inputs if "h" in n and "n" not in n), None)
         self.name_c = next((n for n in inputs if "c" in n and "n" not in n), None)
-        
-        outputs = {o.name: o for o in self.sess.get_outputs()}
-        self.name_prob = next((n for n in outputs if "prob" in n or "output" in n or "y" in n), None)
-        self.name_hn = next((n for n in outputs if "h" in n and n != self.name_h), None)
-        self.name_cn = next((n for n in outputs if "c" in n and n != self.name_c), None)
+        self.h, self.c = np.zeros((2, 1, 64), dtype=np.float32), np.zeros((2, 1, 64), dtype=np.float32)
 
-        self.h = np.zeros((2, 1, 64), dtype=np.float32)
-        self.c = np.zeros((2, 1, 64), dtype=np.float32)
-
-    def forward(self, audio_16k):
-        feed = {self.name_audio: audio_16k.reshape(1, -1).astype(np.float32)}
-        if self.name_sr: feed[self.name_sr] = self.sr
-        if self.name_h is not None: feed[self.name_h] = self.h
-        if self.name_c is not None: feed[self.name_c] = self.c
-        
+    def forward(self, audio):
+        feed = {self.name_audio: audio.reshape(1, -1).astype(np.float32)}
+        if self.name_sr: feed[self.name_sr] = np.array([16000], dtype=np.int64)
+        if self.name_h is not None: feed[self.name_h], feed[self.name_c] = self.h, self.c
         outs = self.sess.run(None, feed)
-        out_map = {o.name: outs[i] for i, o in enumerate(self.sess.get_outputs())}
-        
-        if self.name_hn: self.h = out_map[self.name_hn]
-        if self.name_cn: self.c = out_map[self.name_cn]
-        return float(out_map[self.name_prob])
+        out_names = [o.name for o in self.sess.get_outputs()]
+        res = {out_names[i]: outs[i] for i in range(len(outs))}
+        if self.name_h is not None:
+            self.h = res[next(n for n in out_names if "h" in n and n != self.name_h)]
+            self.c = res[next(n for n in out_names if "c" in n and n != self.name_c)]
+        return float(res[next(n for n in out_names if "prob" in n or "output" in n or "y" in n)])
 
-def audio_thread_func():
-    # Bluetooth relay typically runs at 44100 or 48000
-    SAMPLING_RATE = 48000 
-    loop_id, loop_ch = 3, 2
+def audio_loop():
+    SAMPLING_RATE = 48000
+    loop_id = 3
     for lid in LOOP_IDS:
         try:
-            dev = sd.query_devices(lid)
-            loop_ch, loop_id = min(dev["max_input_channels"], 2), lid
-            break
+            sd.query_devices(lid); loop_id = lid; break
         except: continue
 
-    vad = SileroVADStateful(ONNX_PATH, VAD_SAMPLE_RATE)
-    vad_hop = VAD_FRAME_16K
-    native_hop = int(vad_hop * (SAMPLING_RATE / VAD_SAMPLE_RATE))
-    
-    loop_history = deque(maxlen=40) 
-    last_speech_time = 0.0
-    set_volume(state.norm_vol)
+    vad = SileroVADStateful(ONNX_PATH)
+    native_hop = int(VAD_FRAME_16K * (SAMPLING_RATE / 16000))
+    loop_history = deque(maxlen=40)
+    last_speech = 0.0
 
-    try:
-        with sd.InputStream(device=MIC_ID, channels=1, samplerate=SAMPLING_RATE, blocksize=native_hop) as m_in, \
-             sd.InputStream(device=loop_id, channels=loop_ch, samplerate=SAMPLING_RATE, blocksize=native_hop) as l_in:
-            
-            while state.running:
-                mic_chunk, _ = m_in.read(native_hop)
-                loop_chunk, _ = l_in.read(native_hop)
-                
-                # Resample to 16k
-                m16 = np.interp(np.linspace(0,1,vad_hop), np.linspace(0,1,native_hop), mic_chunk[:,0]).astype(np.float32)
-                l16 = np.interp(np.linspace(0,1,vad_hop), np.linspace(0,1,native_hop), loop_chunk[:,0]).astype(np.float32)
+    with sd.InputStream(device=MIC_ID, channels=1, samplerate=SAMPLING_RATE, blocksize=native_hop) as m_in, \
+         sd.InputStream(device=loop_id, channels=2, samplerate=SAMPLING_RATE, blocksize=native_hop) as l_in:
+        while state.running:
+            m_chunk, _ = m_in.read(native_hop)
+            l_chunk, _ = l_in.read(native_hop)
+            m16 = np.interp(np.linspace(0,1,512), np.linspace(0,1,native_hop), m_chunk[:,0]).astype(np.float32)
+            l16 = np.interp(np.linspace(0,1,512), np.linspace(0,1,native_hop), l_chunk[:,0]).astype(np.float32)
+            loop_history.append(l16)
 
-                loop_history.append(l16)
-                
-                if len(loop_history) >= state.aec_delay:
-                    ref = list(loop_history)[-int(state.aec_delay)]
-                    clean = m16 - (state.aec_strength * ref)
-                    clean = np.clip(clean, -1.0, 1.0)
-                else:
-                    clean = m16
-                
-                state.prob = vad.forward(clean)
-                now = time.time()
+            if len(loop_history) >= state.aec_delay:
+                ref = list(loop_history)[-int(state.aec_delay)]
+                clean = np.clip(m16 - (state.aec_strength * ref), -1.0, 1.0)
+            else: clean = m16
 
-                if state.enabled:
-                    if state.prob > state.vad_threshold:
-                        if not state.ducked:
-                            set_volume(state.duck_vol)
-                            state.ducked = True
-                        last_speech_time = now
-                    elif state.ducked and (now - last_speech_time > state.unduck_sec):
-                        set_volume(state.norm_vol)
-                        state.ducked = False
-                elif state.ducked:
-                    set_volume(state.norm_vol)
-                    state.ducked = False
-    except Exception as e:
-        print(f"Audio Error: {e}")
+            state.prob = vad.forward(clean)
+            socketio.emit('stat', {'prob': round(state.prob, 2), 'ducked': state.ducked})
 
-class AudioGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("🛡️ Voice Ducking")
-        self.root.geometry("400x550")
-        self.root.configure(bg="#121212")
+            if state.enabled:
+                if state.prob > state.vad_threshold:
+                    if not state.ducked: set_volume(state.duck_vol); state.ducked = True
+                    last_speech = time.time()
+                elif state.ducked and (time.time() - last_speech > state.unduck_sec):
+                    set_volume(state.norm_vol); state.ducked = False
 
-        self.btn_toggle = tk.Button(root, text="DISABLE DUCKING", bg="#d32f2f", fg="white", 
-                                    font=("Arial", 12, "bold"), command=self.toggle_system)
-        self.btn_toggle.pack(fill="x", padx=20, pady=20)
+# --- WEB ROUTES ---
 
-        self.lbl_prob = tk.Label(root, text="Prob: 0.00", bg="#121212", fg="#00ff00")
-        self.lbl_prob.pack()
-        
-        self.prob_bar = ttk.Progressbar(root, length=300, mode='determinate')
-        self.prob_bar.pack(pady=10)
+@app.route('/')
+def index():
+    return """
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+        <style>
+            body { font-family: sans-serif; background: #121212; color: white; text-align: center; padding: 20px; }
+            .card { background: #1e1e1e; padding: 20px; border-radius: 15px; margin-bottom: 20px; }
+            input[type=range] { width: 100%; margin: 15px 0; }
+            #status { font-size: 1.5em; font-weight: bold; padding: 10px; border-radius: 10px; }
+            .active { background: #d32f2f; } .idle { background: #388e3c; }
+            button { padding: 15px; width: 100%; border-radius: 10px; border: none; font-weight: bold; cursor: pointer; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div id="status" class="idle">MONITORING</div>
+            <h2 id="prob_text">Prob: 0.00</h2>
+        </div>
+        <div class="card">
+            <button id="toggleBtn" onclick="toggleSystem()" style="background: #d32f2f; color: white;">DISABLE DUCKING</button>
+        </div>
+        <div class="card">
+            <label>AEC Delay (Bluetooth Lag)</label>
+            <input type="range" min="1" max="35" step="1" value="14" oninput="update('aec_delay', this.value)">
+            <label>VAD Threshold (Sensitivity)</label>
+            <input type="range" min="0" max="1" step="0.05" value="0.70" oninput="update('vad_threshold', this.value)">
+            <label>Normal Volume %</label>
+            <input type="range" min="0" max="100" step="1" value="80" oninput="update('norm_vol', this.value)">
+        </div>
+        <script>
+            var socket = io();
+            var enabled = true;
+            socket.on('stat', function(data) {
+                document.getElementById('prob_text').innerText = "Prob: " + data.prob;
+                let status = document.getElementById('status');
+                if (data.ducked) { status.innerText = "DUCKING"; status.className = "active"; }
+                else { status.innerText = "MONITORING"; status.className = "idle"; }
+            });
+            function update(key, val) { socket.emit('update', {key: key, val: val}); }
+            function toggleSystem() {
+                enabled = !enabled;
+                socket.emit('update', {key: 'enabled', val: enabled});
+                let btn = document.getElementById('toggleBtn');
+                btn.innerText = enabled ? "DISABLE DUCKING" : "ENABLE DUCKING";
+                btn.style.background = enabled ? "#d32f2f" : "#388e3c";
+            }
+        </script>
+    </body>
+    </html>
+    """
 
-        self.create_slider("AEC Delay", 1, 30, "aec_delay")
-        self.create_slider("AEC Strength", 0, 1, "aec_strength", True)
-        self.create_slider("VAD Threshold", 0, 1, "vad_threshold", True)
-        self.create_slider("Normal Volume", 0, 100, "norm_vol")
-        
-        self.update_gui()
+@socketio.on('update')
+def handle_update(data):
+    setattr(state, data['key'], float(data['val']) if '.' in str(data['val']) else int(data['val']))
 
-    def toggle_system(self):
-        state.enabled = not state.enabled
-        self.btn_toggle.config(text="DISABLE DUCKING" if state.enabled else "ENABLE DUCKING",
-                               bg="#d32f2f" if state.enabled else "#388e3c")
-
-    def create_slider(self, label, start, end, attr, is_float=False):
-        tk.Label(self.root, text=label, bg="#121212", fg="white").pack()
-        val = tk.DoubleVar(value=getattr(state, attr))
-        def update_val(v): setattr(state, attr, float(v) if is_float else int(float(v)))
-        ttk.Scale(self.root, from_=start, to=end, variable=val, command=update_val, orient="horizontal").pack(fill="x", padx=40, pady=5)
-
-    def update_gui(self):
-        self.prob_bar['value'] = state.prob * 100
-        self.lbl_prob.config(text=f"Speech Probability: {state.prob:.2f}")
-        if state.running: self.root.after(100, self.update_gui)
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = AudioGUI(root)
-    threading.Thread(target=audio_thread_func, daemon=True).start()
-    root.mainloop()
+if __name__ == '__main__':
+    threading.Thread(target=audio_loop, daemon=True).start()
+    socketio.run(app, host='0.0.0.0', port=5000)
