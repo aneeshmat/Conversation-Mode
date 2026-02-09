@@ -1,5 +1,5 @@
 # conversation_mode_v6_universal.py
-# Raspberry Pi 3A • Python 3.13 • Pure-Python Silero VAD
+# Raspberry Pi 3A • Python 3.13 • WebRTC VAD (fast, tiny, reliable)
 
 import time
 import threading
@@ -8,8 +8,7 @@ import sounddevice as sd
 import tkinter as tk
 from tkinter import ttk
 import platform
-
-from silero_vad import load_silero_vad
+import webrtcvad
 
 # ---------------------------
 # OS-SPECIFIC SETUP
@@ -26,21 +25,38 @@ else:
     print("🍓 Pi/Linux detected.")
 
 # ---------------------------
-# LOAD SILERO VAD (PURE PYTHON)
+# LOAD WEBRTC VAD
 # ---------------------------
 SAMPLE_RATE = 16000
-FRAME_SIZE = 512
+FRAME_SIZE = 512  # ~32ms at 16kHz
 
-# Load the pure-Python Silero VAD model
-vad_model = load_silero_vad()
+# WebRTC VAD requires 10, 20, or 30 ms frames
+# 30 ms at 16kHz = 480 samples → we will trim/pad to 480
+VAD_FRAME = 480
+
+vad = webrtcvad.Vad()
+vad.set_mode(2)  # 0=least sensitive, 3=most sensitive
 
 def get_vad_prob(audio_frame: np.ndarray) -> float:
     """
-    audio_frame: 1D float32 numpy array, mono, 16 kHz
-    Returns: speech probability (0.0–1.0)
+    Returns a pseudo-probability (0.0–1.0) based on WebRTC VAD.
+    WebRTC VAD is binary, so we smooth it into a probability.
     """
-    prob = vad_model(audio_frame)
-    return float(prob)
+    global vad_state
+
+    # Ensure correct frame size
+    if len(audio_frame) < VAD_FRAME:
+        audio_frame = np.pad(audio_frame, (0, VAD_FRAME - len(audio_frame)))
+    else:
+        audio_frame = audio_frame[:VAD_FRAME]
+
+    # Convert to 16-bit PCM
+    pcm16 = (audio_frame * 32767).astype(np.int16).tobytes()
+
+    is_speech = vad.is_speech(pcm16, SAMPLE_RATE)
+
+    # Smooth into probability
+    return 0.9 if is_speech else 0.1
 
 # ---------------------------
 # CROSS-PLATFORM VOLUME WRAPPERS
@@ -85,7 +101,6 @@ else:
 DUCK_RATIO = 0.50
 MIN_BASELINE = 0.10
 duck_duration = 2
-EPS = 0.01
 USER_DEVIATE_EPS = 0.03
 
 duck_lock = threading.Lock()
@@ -161,7 +176,7 @@ def audio_callback(indata, frames, time_info, status):
 class DuckApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Dynamic Ducking (Silero VAD / Pi 3A)")
+        self.root.title("Dynamic Ducking (WebRTC VAD / Pi 3A)")
 
         self.btn = ttk.Button(root, text="Start", command=self.toggle)
         self.btn.pack(pady=20, padx=20)
