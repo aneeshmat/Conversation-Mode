@@ -18,9 +18,8 @@ ONNX_PATH = "silero_vad.onnx"
 VAD_SAMPLE_RATE = 16000
 VAD_FRAME_16K = 512
 
-# Set these to match your actual devices (from sd.query_devices())
-MIC_ID = 4          # USB PnP Audio Device (1 in, 0 out)
-LOOP_IDS = [1]      # ALSA Loopback: PCM (hw:0,1), or your monitor candidate list
+MIC_ID = 4          # USB PnP Audio Device
+LOOP_IDS = [1]      # ALSA Loopback device
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -127,13 +126,11 @@ def set_volume(vol_percent):
 
 
 def audio_loop():
-    # Use mic at its native rate (48 kHz), then resample to 16 kHz for VAD
     MIC_RATE = 48000
     LOOP_RATE = 48000
     mic_channels = 1
     loop_channels = 1
 
-    # Number of samples per block at mic rate corresponding to 512 samples at 16 kHz
     BLOCK_MIC = int(VAD_FRAME_16K * (MIC_RATE / VAD_SAMPLE_RATE))
     BLOCK_LOOP = int(VAD_FRAME_16K * (LOOP_RATE / VAD_SAMPLE_RATE))
 
@@ -147,7 +144,7 @@ def audio_loop():
             continue
 
     if loop_id is None:
-        print("❌ No valid loopback device found from LOOP_IDS.")
+        print("❌ No valid loopback device found.")
         return
 
     try:
@@ -180,7 +177,11 @@ def audio_loop():
                 m_raw = m_chunk[:, 0].astype(np.float32)
                 l_raw = l_chunk[:, 0].astype(np.float32)
 
-                # Resample both to 16 kHz, 512 samples
+                # Optional RMS debug
+                rms = float(np.sqrt(np.mean(m_raw**2)))
+                print(f"[MIC RMS] {rms:.4f}")
+
+                # Resample to 16 kHz
                 t16 = np.linspace(0.0, 1.0, VAD_FRAME_16K, endpoint=False)
                 t_mic = np.linspace(0.0, 1.0, BLOCK_MIC, endpoint=False)
                 t_loop = np.linspace(0.0, 1.0, BLOCK_LOOP, endpoint=False)
@@ -205,15 +206,24 @@ def audio_loop():
                     {"prob": round(state.prob, 2), "ducked": state.ducked},
                 )
 
+                # -----------------------------
+                # SPEECH / DUCKING DEBUG PRINTS
+                # -----------------------------
                 if state.enabled:
                     if state.prob > state.vad_threshold:
+                        print(f"[VAD] Speech detected (prob={state.prob:.2f})")
+
                         if not state.ducked:
+                            print(f"[DUCK] Ducking volume → {state.duck_vol}%")
                             set_volume(state.duck_vol)
                             state.ducked = True
+
                         last_speech = time.time()
+
                     elif state.ducked and (
                         time.time() - last_speech > state.unduck_sec
                     ):
+                        print(f"[RESTORE] Restoring volume → {state.norm_vol}%")
                         set_volume(state.norm_vol)
                         state.ducked = False
 
