@@ -1,3 +1,4 @@
+print("=== RUNNING VERSION: 2026-02-10-DEBUG-01 ===")
 import os
 import time
 import threading
