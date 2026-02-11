@@ -17,8 +17,10 @@ os.environ["ORT_LOGGING_LEVEL"] = "3"
 ONNX_PATH = "silero_vad.onnx"
 VAD_SAMPLE_RATE = 16000
 VAD_FRAME_16K = 512
-MIC_ID = 2
-LOOP_IDS = [3, 4]  # candidate loopback devices (PulseAudio monitors, etc.)
+
+# Set these to match your actual devices (from sd.query_devices())
+MIC_ID = 4          # USB PnP Audio Device (1 in, 0 out)
+LOOP_IDS = [1]      # ALSA Loopback: PCM (hw:0,1), or your monitor candidate list
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -125,10 +127,15 @@ def set_volume(vol_percent):
 
 
 def audio_loop():
-    SAMPLING_RATE = VAD_SAMPLE_RATE  # 16 kHz to avoid resampling
-    BLOCKSIZE = VAD_FRAME_16K        # 512 samples
-    mic_channels = 1                 # Option C: force mono
-    loop_channels = 1                # Option C: force mono
+    # Use mic at its native rate (48 kHz), then resample to 16 kHz for VAD
+    MIC_RATE = 48000
+    LOOP_RATE = 48000
+    mic_channels = 1
+    loop_channels = 1
+
+    # Number of samples per block at mic rate corresponding to 512 samples at 16 kHz
+    BLOCK_MIC = int(VAD_FRAME_16K * (MIC_RATE / VAD_SAMPLE_RATE))
+    BLOCK_LOOP = int(VAD_FRAME_16K * (LOOP_RATE / VAD_SAMPLE_RATE))
 
     loop_id = None
     for lid in LOOP_IDS:
@@ -158,20 +165,28 @@ def audio_loop():
         with sd.InputStream(
             device=MIC_ID,
             channels=mic_channels,
-            samplerate=SAMPLING_RATE,
-            blocksize=BLOCKSIZE,
+            samplerate=MIC_RATE,
+            blocksize=BLOCK_MIC,
         ) as m_in, sd.InputStream(
             device=loop_id,
             channels=loop_channels,
-            samplerate=SAMPLING_RATE,
-            blocksize=BLOCKSIZE,
+            samplerate=LOOP_RATE,
+            blocksize=BLOCK_LOOP,
         ) as l_in:
             while state.running:
-                m_chunk, _ = m_in.read(BLOCKSIZE)
-                l_chunk, _ = l_in.read(BLOCKSIZE)
+                m_chunk, _ = m_in.read(BLOCK_MIC)
+                l_chunk, _ = l_in.read(BLOCK_LOOP)
 
-                m16 = m_chunk[:, 0].astype(np.float32)
-                l16 = l_chunk[:, 0].astype(np.float32)
+                m_raw = m_chunk[:, 0].astype(np.float32)
+                l_raw = l_chunk[:, 0].astype(np.float32)
+
+                # Resample both to 16 kHz, 512 samples
+                t16 = np.linspace(0.0, 1.0, VAD_FRAME_16K, endpoint=False)
+                t_mic = np.linspace(0.0, 1.0, BLOCK_MIC, endpoint=False)
+                t_loop = np.linspace(0.0, 1.0, BLOCK_LOOP, endpoint=False)
+
+                m16 = np.interp(t16, t_mic, m_raw)
+                l16 = np.interp(t16, t_loop, l_raw)
 
                 loop_history.append(l16)
 
