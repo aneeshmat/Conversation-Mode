@@ -32,7 +32,7 @@ class AppState:
         self.prob = 0.0
         self.aec_delay = 14
         self.aec_strength = 0.85
-        self.vad_threshold = 0.70
+        self.vad_threshold = 0.30   # LOWERED FOR TESTING
         self.duck_vol = 20
         self.norm_vol = 80
         self.unduck_sec = 2.0
@@ -40,7 +40,7 @@ class AppState:
 
 state = AppState()
 
-# ----------------- UNIVERSAL VAD FOR YOUR MODEL -----------------
+# ----------------- VAD FOR YOUR MODEL -----------------
 
 class SileroVADStateful:
     """
@@ -75,18 +75,14 @@ class SileroVADStateful:
 
         print("DEBUG: ONNX model loaded successfully.")
 
-        # Your model uses fixed names:
         self.name_x = "input"
         self.name_state = "state"
         self.name_sr = "sr"
 
-        # Output order is fixed: [output, stateN]
         self.idx_prob = 0
         self.idx_stateN = 1
 
-        # Initialize state: [2, 1, 128]
         self.state = np.zeros((2, 1, 128), dtype=np.float32)
-
         print("DEBUG: VAD ready. State shape:", self.state.shape)
 
     def forward(self, audio):
@@ -125,14 +121,12 @@ def audio_loop():
     BLOCK_MIC = int(VAD_FRAME_16K * (MIC_RATE / VAD_SAMPLE_RATE))
     BLOCK_LOOP = int(VAD_FRAME_16K * (LOOP_RATE / VAD_SAMPLE_RATE))
 
-    # Load VAD
     try:
         vad = SileroVADStateful(ONNX_PATH)
     except Exception:
         print("❌ Could not initialize VAD. Exiting.")
         return
 
-    # Pick loopback device
     loop_id = None
     for lid in LOOP_IDS:
         try:
@@ -177,20 +171,21 @@ def audio_loop():
         rms = float(np.sqrt(np.mean(m_raw**2)))
         print(f"[MIC RMS] {rms:.4f}")
 
-        # Resample to 16 kHz
         t16 = np.linspace(0, 1, VAD_FRAME_16K, endpoint=False)
         m16 = np.interp(t16, np.linspace(0, 1, BLOCK_MIC, endpoint=False), m_raw)
         l16 = np.interp(t16, np.linspace(0, 1, BLOCK_LOOP, endpoint=False), l_raw)
 
         loop_history.append(l16)
 
-        if len(loop_history) >= state.aec_delay:
-            ref = loop_history[-state.aec_delay]
-            clean = np.clip(m16 - state.aec_strength * ref, -1, 1)
-        else:
-            clean = m16
+        # TEMP: disable AEC for debugging
+        clean = m16
+
+        # Boost amplitude for VAD
+        clean = clean * 3.0
+        clean = np.clip(clean, -1, 1)
 
         state.prob = vad.forward(clean)
+        print(f"[VAD PROB] {state.prob:.4f}")
 
         socketio.emit("stat", {"prob": round(state.prob, 2), "ducked": state.ducked})
 
