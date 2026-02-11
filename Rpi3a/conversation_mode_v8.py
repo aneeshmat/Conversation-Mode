@@ -136,6 +136,7 @@ def audio_loop():
     BLOCK_MIC = int(VAD_FRAME_16K * (MIC_RATE / VAD_SAMPLE_RATE))
     BLOCK_LOOP = int(VAD_FRAME_16K * (LOOP_RATE / VAD_SAMPLE_RATE))
 
+    # Pick loopback device
     loop_id = None
     for lid in LOOP_IDS:
         try:
@@ -149,6 +150,7 @@ def audio_loop():
         print("❌ No valid loopback device found.")
         return
 
+    # Load VAD
     try:
         vad = SileroVADStateful(ONNX_PATH)
     except Exception as e:
@@ -182,14 +184,18 @@ def audio_loop():
         l_in.start()
         print("DEBUG: Streams started successfully")
 
-        # -------- MAIN LOOP --------
+        # -------------------------
+        # MAIN AUDIO PROCESS LOOP
+        # -------------------------
         while state.running:
+            # Read audio
             m_chunk, _ = m_in.read(BLOCK_MIC)
             l_chunk, _ = l_in.read(BLOCK_LOOP)
 
             m_raw = m_chunk[:, 0].astype(np.float32)
             l_raw = l_chunk[:, 0].astype(np.float32)
 
+            # RMS debug
             rms = float(np.sqrt(np.mean(m_raw**2)))
             print(f"[MIC RMS] {rms:.4f}")
 
@@ -205,19 +211,21 @@ def audio_loop():
 
             if len(loop_history) >= int(state.aec_delay):
                 ref = loop_history[-int(state.aec_delay)]
-                clean = np.clip(
-                    m16 - (state.aec_strength * ref), -1.0, 1.0
-                )
+                clean = np.clip(m16 - (state.aec_strength * ref), -1.0, 1.0)
             else:
                 clean = m16
 
+            # VAD
             state.prob = vad.forward(clean)
 
-            socketio.emit(
-                "stat",
-                {"prob": round(state.prob, 2), "ducked": state.ducked},
-            )
+            socketio.emit("stat", {
+                "prob": round(state.prob, 2),
+                "ducked": state.ducked
+            })
 
+            # -------------------------
+            # DUCKING LOGIC + PRINTS
+            # -------------------------
             if state.enabled:
                 if state.prob > state.vad_threshold:
                     print(f"[VAD] Speech detected (prob={state.prob:.2f})")
@@ -229,9 +237,7 @@ def audio_loop():
 
                     last_speech = time.time()
 
-                elif state.ducked and (
-                    time.time() - last_speech > state.unduck_sec
-                ):
+                elif state.ducked and (time.time() - last_speech > state.unduck_sec):
                     print(f"[RESTORE] Restoring volume → {state.norm_vol}%")
                     set_volume(state.norm_vol)
                     state.ducked = False
