@@ -1,0 +1,10 @@
+cd /d C:\Users\anees\OneDrive\Documents\GitHub\Conversation-Mode\windows_v1
+
+rem Duck WILLEN (render endpoints index 78)
+set AEC_SPEAKER_INDEX=78
+
+rem Set your mic and loopback PortAudio indices (adjust if needed)
+set AEC_MIC_ID=30
+set AEC_LOOP_ID=29
+
+python conversation_mode_aec_v2.py
