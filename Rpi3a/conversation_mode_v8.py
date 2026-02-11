@@ -12,6 +12,7 @@ import onnxruntime as ort
 
 os.environ["ORT_LOGGING_LEVEL"] = "3"
 
+# ----------------- CONFIG -----------------
 ONNX_PATH = "silero_vad.onnx"
 VAD_SAMPLE_RATE = 16000
 VAD_FRAME_16K = 512
@@ -39,10 +40,22 @@ class AppState:
 
 state = AppState()
 
-
-# ---------------- UNIVERSAL VAD ENGINE ----------------
+# ----------------- UNIVERSAL VAD FOR YOUR MODEL -----------------
 
 class SileroVADStateful:
+    """
+    Matches your ONNX model exactly:
+
+    INPUTS:
+      input  : [None, None] float
+      state  : [2, None, 128] float
+      sr     : [] int64
+
+    OUTPUTS:
+      output : [None, 1] float
+      stateN : [None, None, None] float
+    """
+
     def __init__(self, path):
         print("DEBUG: Loading ONNX model:", path)
 
@@ -62,77 +75,36 @@ class SileroVADStateful:
 
         print("DEBUG: ONNX model loaded successfully.")
 
-        # ---- UNIVERSAL INPUT DETECTION ----
-        inputs = self.sess.get_inputs()
-        outputs = self.sess.get_outputs()
+        # Your model uses fixed names:
+        self.name_x = "input"
+        self.name_state = "state"
+        self.name_sr = "sr"
 
-        # Audio input
-        self.name_x = None
-        for inp in inputs:
-            if inp.shape[-1] > 1 or inp.shape[-1] == 512:
-                self.name_x = inp.name
-                break
-        if self.name_x is None:
-            self.name_x = inputs[0].name
+        # Output order is fixed: [output, stateN]
+        self.idx_prob = 0
+        self.idx_stateN = 1
 
-        # Sample rate (optional)
-        self.name_sr = None
-        for inp in inputs:
-            if "sr" in inp.name.lower():
-                self.name_sr = inp.name
+        # Initialize state: [2, 1, 128]
+        self.state = np.zeros((2, 1, 128), dtype=np.float32)
 
-        # Hidden states (optional)
-        self.name_h = None
-        self.name_c = None
-        for inp in inputs:
-            if "h" in inp.name.lower():
-                self.name_h = inp.name
-            if "c" in inp.name.lower():
-                self.name_c = inp.name
-
-        # ---- UNIVERSAL OUTPUT DETECTION ----
-        self.idx_prob = None
-        self.idx_h_out = None
-        self.idx_c_out = None
-
-        for idx, out in enumerate(outputs):
-            name = out.name.lower()
-            if "prob" in name or "output" in name or "y" in name:
-                self.idx_prob = idx
-            if "h" in name:
-                self.idx_h_out = idx
-            if "c" in name:
-                self.idx_c_out = idx
-
-        # Hidden states may not exist in some models
-        self.h = np.zeros((2, 1, 64), dtype=np.float32)
-        self.c = np.zeros((2, 1, 64), dtype=np.float32)
-
-        print("DEBUG: VAD input:", self.name_x)
-        print("DEBUG: VAD prob output index:", self.idx_prob)
+        print("DEBUG: VAD ready. State shape:", self.state.shape)
 
     def forward(self, audio):
-        feed = {self.name_x: audio.reshape(1, -1).astype(np.float32)}
-
-        if self.name_sr:
-            feed[self.name_sr] = np.array([VAD_SAMPLE_RATE], dtype=np.int64)
-
-        if self.name_h:
-            feed[self.name_h] = self.h
-        if self.name_c:
-            feed[self.name_c] = self.c
+        feed = {
+            self.name_x: audio.reshape(1, -1).astype(np.float32),
+            self.name_state: self.state,
+            self.name_sr: np.array(16000, dtype=np.int64)
+        }
 
         outs = self.sess.run(None, feed)
 
-        if self.idx_h_out is not None:
-            self.h = outs[self.idx_h_out]
-        if self.idx_c_out is not None:
-            self.c = outs[self.idx_c_out]
+        prob = outs[self.idx_prob]
+        self.state = outs[self.idx_stateN]
 
-        return float(outs[self.idx_prob].reshape(-1)[0])
+        return float(prob.reshape(-1)[0])
 
 
-# ---------------- AUDIO / VOLUME ----------------
+# ----------------- AUDIO / VOLUME -----------------
 
 def set_volume(vol_percent):
     threading.Thread(
@@ -153,7 +125,7 @@ def audio_loop():
     BLOCK_MIC = int(VAD_FRAME_16K * (MIC_RATE / VAD_SAMPLE_RATE))
     BLOCK_LOOP = int(VAD_FRAME_16K * (LOOP_RATE / VAD_SAMPLE_RATE))
 
-    # Load VAD ONCE
+    # Load VAD
     try:
         vad = SileroVADStateful(ONNX_PATH)
     except Exception:
@@ -238,6 +210,8 @@ def audio_loop():
                 set_volume(state.norm_vol)
                 state.ducked = False
 
+
+# ----------------- WEB -----------------
 
 @app.route("/")
 def index():
