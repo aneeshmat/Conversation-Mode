@@ -1,4 +1,3 @@
-print("=== RUNNING VERSION: 2026-02-10-DEBUG-01 ===")
 import os
 import time
 import threading
@@ -15,7 +14,7 @@ import onnxruntime as ort
 os.environ["ORT_LOGGING_LEVEL"] = "3"
 
 # ----------------- CONFIGURATION -----------------
-ONNX_PATH = "silero_vad.onnx"
+ONNX_PATH = "silero_vad.onnx"   # Must be in same folder
 VAD_SAMPLE_RATE = 16000
 VAD_FRAME_16K = 512
 
@@ -47,13 +46,23 @@ state = AppState()
 
 class SileroVADStateful:
     def __init__(self, path):
+        print("DEBUG: Loading ONNX model:", path)
+
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 1
         opts.inter_op_num_threads = 1
 
-        self.sess = ort.InferenceSession(
-            path, sess_options=opts, providers=["CPUExecutionProvider"]
-        )
+        try:
+            self.sess = ort.InferenceSession(
+                path, sess_options=opts, providers=["CPUExecutionProvider"]
+            )
+        except Exception as e:
+            print("❌ Failed to load VAD model!")
+            import traceback
+            traceback.print_exc()
+            raise
+
+        print("DEBUG: ONNX model loaded successfully.")
 
         inputs = {i.name: i for i in self.sess.get_inputs()}
         self.name_x = next(
@@ -61,27 +70,13 @@ class SileroVADStateful:
             "x",
         )
         self.name_sr = next((n for n in inputs if "sr" in n.lower()), None)
-        self.name_h = next(
-            (n for n in inputs if "h" in n.lower() and "n" not in n.lower()), "h"
-        )
-        self.name_c = next(
-            (n for n in inputs if "c" in n.lower() and "n" not in n.lower()), "c"
-        )
+        self.name_h = next((n for n in inputs if "h" in n.lower()), "h")
+        self.name_c = next((n for n in inputs if "c" in n.lower()), "c")
 
         outputs = {o.name: idx for idx, o in enumerate(self.sess.get_outputs())}
-        self.idx_prob = outputs[
-            next(
-                n
-                for n in outputs
-                if any(k in n.lower() for k in ["prob", "output", "y"])
-            )
-        ]
-        self.idx_h_out = outputs[
-            next(n for n in outputs if "h" in n.lower() and "n" not in n.lower())
-        ]
-        self.idx_c_out = outputs[
-            next(n for n in outputs if "c" in n.lower() and "n" not in n.lower())
-        ]
+        self.idx_prob = outputs[next(n for n in outputs if "prob" in n.lower())]
+        self.idx_h_out = outputs[next(n for n in outputs if "h" in n.lower())]
+        self.idx_c_out = outputs[next(n for n in outputs if "c" in n.lower())]
 
         self.h = np.zeros((2, 1, 64), dtype=np.float32)
         self.c = np.zeros((2, 1, 64), dtype=np.float32)
@@ -111,12 +106,7 @@ def set_volume(vol_percent):
     def worker():
         try:
             subprocess.run(
-                [
-                    "pactl",
-                    "set-sink-volume",
-                    "@DEFAULT_SINK@",
-                    f"{int(vol_percent)}%",
-                ],
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(vol_percent)}%"],
                 check=True,
                 capture_output=True,
             )
@@ -154,8 +144,8 @@ def audio_loop():
     # Load VAD
     try:
         vad = SileroVADStateful(ONNX_PATH)
-    except Exception as e:
-        print(f"Failed to load VAD: {e}")
+    except Exception:
+        print("❌ VAD load failed. Exiting audio loop.")
         return
 
     loop_history = deque(maxlen=40)
@@ -189,7 +179,6 @@ def audio_loop():
         # MAIN AUDIO PROCESS LOOP
         # -------------------------
         while state.running:
-            # Read audio
             m_chunk, _ = m_in.read(BLOCK_MIC)
             l_chunk, _ = l_in.read(BLOCK_LOOP)
 
@@ -313,5 +302,8 @@ def handle_update(data):
 
 
 if __name__ == "__main__":
-    threading.Thread(target=audio_loop, daemon=True).start()
+    print("=== MAIN STARTED ===")
+    t = threading.Thread(target=audio_loop, daemon=True)
+    t.start()
+    print("=== THREAD LAUNCHED ===")
     socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
