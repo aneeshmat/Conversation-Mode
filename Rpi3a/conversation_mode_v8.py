@@ -40,7 +40,7 @@ class AppState:
 state = AppState()
 
 
-# ---------------- VAD ENGINE ----------------
+# ---------------- UNIVERSAL VAD ENGINE ----------------
 
 class SileroVADStateful:
     def __init__(self, path):
@@ -62,32 +62,73 @@ class SileroVADStateful:
 
         print("DEBUG: ONNX model loaded successfully.")
 
-        inputs = {i.name: i for i in self.sess.get_inputs()}
-        self.name_x = next(n for n in inputs)
-        self.name_sr = next((n for n in inputs if "sr" in n.lower()), None)
-        self.name_h = next((n for n in inputs if "h" in n.lower()), None)
-        self.name_c = next((n for n in inputs if "c" in n.lower()), None)
+        # ---- UNIVERSAL INPUT DETECTION ----
+        inputs = self.sess.get_inputs()
+        outputs = self.sess.get_outputs()
 
-        outputs = {o.name: idx for idx, o in enumerate(self.sess.get_outputs())}
-        self.idx_prob = next(idx for name, idx in outputs.items() if "prob" in name.lower())
-        self.idx_h_out = next(idx for name, idx in outputs.items() if "h" in name.lower())
-        self.idx_c_out = next(idx for name, idx in outputs.items() if "c" in name.lower())
+        # Audio input
+        self.name_x = None
+        for inp in inputs:
+            if inp.shape[-1] > 1 or inp.shape[-1] == 512:
+                self.name_x = inp.name
+                break
+        if self.name_x is None:
+            self.name_x = inputs[0].name
 
+        # Sample rate (optional)
+        self.name_sr = None
+        for inp in inputs:
+            if "sr" in inp.name.lower():
+                self.name_sr = inp.name
+
+        # Hidden states (optional)
+        self.name_h = None
+        self.name_c = None
+        for inp in inputs:
+            if "h" in inp.name.lower():
+                self.name_h = inp.name
+            if "c" in inp.name.lower():
+                self.name_c = inp.name
+
+        # ---- UNIVERSAL OUTPUT DETECTION ----
+        self.idx_prob = None
+        self.idx_h_out = None
+        self.idx_c_out = None
+
+        for idx, out in enumerate(outputs):
+            name = out.name.lower()
+            if "prob" in name or "output" in name or "y" in name:
+                self.idx_prob = idx
+            if "h" in name:
+                self.idx_h_out = idx
+            if "c" in name:
+                self.idx_c_out = idx
+
+        # Hidden states may not exist in some models
         self.h = np.zeros((2, 1, 64), dtype=np.float32)
         self.c = np.zeros((2, 1, 64), dtype=np.float32)
 
+        print("DEBUG: VAD input:", self.name_x)
+        print("DEBUG: VAD prob output index:", self.idx_prob)
+
     def forward(self, audio):
-        feed = {
-            self.name_x: audio.reshape(1, -1).astype(np.float32),
-            self.name_h: self.h,
-            self.name_c: self.c,
-        }
+        feed = {self.name_x: audio.reshape(1, -1).astype(np.float32)}
+
         if self.name_sr:
             feed[self.name_sr] = np.array([VAD_SAMPLE_RATE], dtype=np.int64)
 
+        if self.name_h:
+            feed[self.name_h] = self.h
+        if self.name_c:
+            feed[self.name_c] = self.c
+
         outs = self.sess.run(None, feed)
-        self.h = outs[self.idx_h_out]
-        self.c = outs[self.idx_c_out]
+
+        if self.idx_h_out is not None:
+            self.h = outs[self.idx_h_out]
+        if self.idx_c_out is not None:
+            self.c = outs[self.idx_c_out]
+
         return float(outs[self.idx_prob].reshape(-1)[0])
 
 
@@ -197,8 +238,6 @@ def audio_loop():
                 set_volume(state.norm_vol)
                 state.ducked = False
 
-
-# ---------------- WEB ----------------
 
 @app.route("/")
 def index():
