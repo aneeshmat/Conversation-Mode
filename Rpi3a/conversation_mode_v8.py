@@ -126,6 +126,8 @@ def set_volume(vol_percent):
 
 
 def audio_loop():
+    print("DEBUG: audio_loop() started")
+
     MIC_RATE = 48000
     LOOP_RATE = 48000
     mic_channels = 1
@@ -159,73 +161,80 @@ def audio_loop():
     print("🚀 Audio Started. Access GUI at http://10.6.1.47:5000")
 
     try:
-        with sd.InputStream(
+        print("DEBUG: Opening mic stream…")
+        m_in = sd.InputStream(
             device=MIC_ID,
             channels=mic_channels,
             samplerate=MIC_RATE,
             blocksize=BLOCK_MIC,
-        ) as m_in, sd.InputStream(
+        )
+
+        print("DEBUG: Opening loopback stream…")
+        l_in = sd.InputStream(
             device=loop_id,
             channels=loop_channels,
             samplerate=LOOP_RATE,
             blocksize=BLOCK_LOOP,
-        ) as l_in:
-            while state.running:
-                m_chunk, _ = m_in.read(BLOCK_MIC)
-                l_chunk, _ = l_in.read(BLOCK_LOOP)
+        )
 
-                m_raw = m_chunk[:, 0].astype(np.float32)
-                l_raw = l_chunk[:, 0].astype(np.float32)
+        print("DEBUG: Starting streams…")
+        m_in.start()
+        l_in.start()
+        print("DEBUG: Streams started successfully")
 
-                # Optional RMS debug
-                rms = float(np.sqrt(np.mean(m_raw**2)))
-                print(f"[MIC RMS] {rms:.4f}")
+        # -------- MAIN LOOP --------
+        while state.running:
+            m_chunk, _ = m_in.read(BLOCK_MIC)
+            l_chunk, _ = l_in.read(BLOCK_LOOP)
 
-                # Resample to 16 kHz
-                t16 = np.linspace(0.0, 1.0, VAD_FRAME_16K, endpoint=False)
-                t_mic = np.linspace(0.0, 1.0, BLOCK_MIC, endpoint=False)
-                t_loop = np.linspace(0.0, 1.0, BLOCK_LOOP, endpoint=False)
+            m_raw = m_chunk[:, 0].astype(np.float32)
+            l_raw = l_chunk[:, 0].astype(np.float32)
 
-                m16 = np.interp(t16, t_mic, m_raw)
-                l16 = np.interp(t16, t_loop, l_raw)
+            rms = float(np.sqrt(np.mean(m_raw**2)))
+            print(f"[MIC RMS] {rms:.4f}")
 
-                loop_history.append(l16)
+            # Resample to 16 kHz
+            t16 = np.linspace(0.0, 1.0, VAD_FRAME_16K, endpoint=False)
+            t_mic = np.linspace(0.0, 1.0, BLOCK_MIC, endpoint=False)
+            t_loop = np.linspace(0.0, 1.0, BLOCK_LOOP, endpoint=False)
 
-                if len(loop_history) >= int(state.aec_delay):
-                    ref = loop_history[-int(state.aec_delay)]
-                    clean = np.clip(
-                        m16 - (state.aec_strength * ref), -1.0, 1.0
-                    )
-                else:
-                    clean = m16
+            m16 = np.interp(t16, t_mic, m_raw)
+            l16 = np.interp(t16, t_loop, l_raw)
 
-                state.prob = vad.forward(clean)
+            loop_history.append(l16)
 
-                socketio.emit(
-                    "stat",
-                    {"prob": round(state.prob, 2), "ducked": state.ducked},
+            if len(loop_history) >= int(state.aec_delay):
+                ref = loop_history[-int(state.aec_delay)]
+                clean = np.clip(
+                    m16 - (state.aec_strength * ref), -1.0, 1.0
                 )
+            else:
+                clean = m16
 
-                # -----------------------------
-                # SPEECH / DUCKING DEBUG PRINTS
-                # -----------------------------
-                if state.enabled:
-                    if state.prob > state.vad_threshold:
-                        print(f"[VAD] Speech detected (prob={state.prob:.2f})")
+            state.prob = vad.forward(clean)
 
-                        if not state.ducked:
-                            print(f"[DUCK] Ducking volume → {state.duck_vol}%")
-                            set_volume(state.duck_vol)
-                            state.ducked = True
+            socketio.emit(
+                "stat",
+                {"prob": round(state.prob, 2), "ducked": state.ducked},
+            )
 
-                        last_speech = time.time()
+            if state.enabled:
+                if state.prob > state.vad_threshold:
+                    print(f"[VAD] Speech detected (prob={state.prob:.2f})")
 
-                    elif state.ducked and (
-                        time.time() - last_speech > state.unduck_sec
-                    ):
-                        print(f"[RESTORE] Restoring volume → {state.norm_vol}%")
-                        set_volume(state.norm_vol)
-                        state.ducked = False
+                    if not state.ducked:
+                        print(f"[DUCK] Ducking volume → {state.duck_vol}%")
+                        set_volume(state.duck_vol)
+                        state.ducked = True
+
+                    last_speech = time.time()
+
+                elif state.ducked and (
+                    time.time() - last_speech > state.unduck_sec
+                ):
+                    print(f"[RESTORE] Restoring volume → {state.norm_vol}%")
+                    set_volume(state.norm_vol)
+                    state.ducked = False
 
     except Exception as e:
         print(f"❌ Audio Loop Error: {e}")
