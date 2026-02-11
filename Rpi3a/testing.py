@@ -18,3 +18,12 @@ print(sd.query_devices(4))
 import sounddevice as sd
 for i, d in enumerate(sd.query_devices()):
     print(i, d['name'], d['max_input_channels'], d['max_output_channels'])
+
+import sounddevice as sd
+
+MIC_ID = 4
+try:
+    sd.check_input_settings(device=MIC_ID, channels=1, samplerate=48000)
+    print("Mic settings OK")
+except Exception as e:
+    print("Mic settings ERROR:", e)
