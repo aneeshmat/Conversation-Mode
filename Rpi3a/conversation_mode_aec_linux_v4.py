@@ -74,6 +74,8 @@ VOLUME_RESTORE_TOL = 2      # +/- % tolerance to consider "unchanged" while duck
 # NEW: how long of silence before we restore volume
 DUCK_HOLD_SILENCE = 0.7     # seconds of no speech before restore
 
+AEC_DELAY = 240
+
 # Optional: override via env vars
 MIC_DEVICE_ID = int(os.getenv("MIC_DEVICE_ID", MIC_DEVICE_ID))
 REF_DEVICE_ID = int(os.getenv("REF_DEVICE_ID", REF_DEVICE_ID))
@@ -463,7 +465,7 @@ def processing_worker():
         # AEC @ 48k
         cleaned_dev = np.zeros_like(mic_dev, dtype=np.float32)
         if aec_state is not None and aec_lib is not None:
-            aec_lib.aec_process_buffer(aec_state, ref_dev, mic_dev, cleaned_dev, FRAME_SIZE, 0)
+            aec_lib.aec_process_buffer(aec_state, ref_dev, mic_dev, cleaned_dev, FRAME_SIZE, AEC_DELAY)
         else:
             cleaned_dev[:] = mic_dev
 
