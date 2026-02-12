@@ -12,7 +12,7 @@ import subprocess
 # ---------------------------
 # Use 'sd.query_devices()' in terminal to find these IDs on your Pi/Zorin
 MIC_DEVICE_ID = 0  
-REF_DEVICE_ID = 0  
+REF_DEVICE_ID = 12  
 SAMPLE_RATE = 16000
 FRAME_SIZE = 512
 DUCK_RATIO = 0.3  # Reduced to 30% volume
