@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 Conversation Mode - Linux (AEC + VAD + Relative Smooth Ducking + Tk GUI)
 
@@ -50,26 +47,21 @@ REF_DEVICE_ID = 12          # PipeWire monitor (reference)
 DEVICE_RATE = 48000         # hardware I/O rate (both mic & ref)
 SAMPLE_RATE = 16000         # Silero VAD expects 16 kHz
 
-# VAD FIX #1: Increase VAD context from 32 ms -> 64 ms
 # 64 ms @ 48k = 3072 frames, which resamples to 1024 @ 16k
 FRAME_SIZE = 3072           # device frames per callback (at 48k)
-VAD_WINDOW_16K = 1024       # VAD window (64 ms at 16k)
+VAD_WINDOW_16K = 1024       # VAD context (64 ms at 16k)
 VAD_THRESHOLD = 0.45        # (unused directly; kept for UI only)
 
-# VAD FIX #2: Hysteresis thresholds
+# VAD hysteresis + smoothing
 VAD_ATTACK = 0.60           # start speech when prob >= 0.60
 VAD_RELEASE = 0.35          # end speech when prob <= 0.35
-
-# VAD FIX #3: Exponential smoothing on probability
 VAD_SMOOTHING = 0.6         # 0..1, higher = more smoothing (slower reaction)
 
-# VAD FIX #4: Gain after AEC to help low-energy speech
+# Signal conditioning
 GAIN_AFTER_AEC = 2.0        # multiply cleaned audio by this before VAD
+HP_ALPHA = 0.995            # DC-blocking high-pass coefficient
 
-# VAD FIX #5: High-pass (DC blocker) to remove rumble/offset before VAD
-HP_ALPHA = 0.995            # 1st-order DC blocker coefficient (close to 1)
-
-# --- Relative ducking configuration (with smooth fades) ---
+# Relative ducking (with smooth fades)
 DUCK_RATIO = 0.5            # duck to 50% of CURRENT volume
 DUCK_SECS = 2.5             # how long to stay ducked
 FADE_STEPS = 6              # steps for smooth fade up/down
@@ -276,19 +268,41 @@ setup_vad()
 
 def warmup_vad():
     """Warm the model once to avoid a compute spike right after streams start."""
-    dummy = np.zeros(VAD_WINDOW_16K, dtype=np.float32)
+    # Torch Silero requires exactly 512 samples @ 16k; use that for warmup.
+    dummy = np.zeros(512, dtype=np.float32)
     _ = vad_prob_16k(dummy)
 
-def vad_prob_16k(audio_16k: np.ndarray) -> float:
-    """Return speech probability for mono float32 16k signal. Requires >= window length."""
-    if audio_16k.size < VAD_WINDOW_16K:
-        return 0.0
-    if USE_TORCH and model is not None:
-        import torch
+def _torch_vad_prob_16k(audio_16k: np.ndarray) -> float:
+    """
+    Torch Hub Silero expects exactly 512 samples at 16 kHz (or 256 @ 8 kHz).
+    If we have >=1024 samples, evaluate two overlapping 512 windows (last 1024) and take max.
+    If we have >=512, evaluate the last 512. Otherwise return 0.0.
+    """
+    import torch
+    n = audio_16k.size
+    if n >= 1024:
+        seg = audio_16k[-1024:]
+        wins = [seg[:512], seg[512:]]
+        probs = []
         with torch.no_grad():
-            t = torch.from_numpy(audio_16k.astype(np.float32))
+            for w in wins:
+                t = torch.from_numpy(w.astype(np.float32))
+                probs.append(float(model(t, SAMPLE_RATE).item()))
+        return max(probs)
+    elif n >= 512:
+        w = audio_16k[-512:]
+        with torch.no_grad():
+            t = torch.from_numpy(w.astype(np.float32))
             return float(model(t, SAMPLE_RATE).item())
+    else:
+        return 0.0
+
+def vad_prob_16k(audio_16k: np.ndarray) -> float:
+    """Return speech probability for mono float32 16k signal."""
+    if USE_TORCH and model is not None:
+        return _torch_vad_prob_16k(audio_16k)
     elif (not USE_TORCH) and vad_session is not None:
+        # ONNX model generally accepts variable lengths; use full window.
         inp_name = vad_session.get_inputs()[0].name
         x = audio_16k.astype(np.float32)[None, :]
         out = vad_session.run(None, {inp_name: x})[0]
@@ -429,20 +443,18 @@ def processing_worker():
 
         # High-pass (DC block) at 48k, then resample to 16k
         cleaned_dev = highpass_dc_block(cleaned_dev, alpha=HP_ALPHA)
-
         cleaned_16k = resample_linear(cleaned_dev, src_sr=DEVICE_RATE, dst_sr=SAMPLE_RATE)
 
         # Gain boost for VAD robustness
         if GAIN_AFTER_AEC != 1.0:
             cleaned_16k = cleaned_16k * np.float32(GAIN_AFTER_AEC)
 
-        # VAD over the last window (64 ms)
-        if cleaned_16k.size >= VAD_WINDOW_16K:
+        # VAD over the last window(s)
+        raw_prob = 0.0
+        if cleaned_16k.size >= 512:
             raw_prob = vad_prob_16k(cleaned_16k[-VAD_WINDOW_16K:])
-        else:
-            raw_prob = 0.0
 
-        # Exponential smoothing
+        # Exponential smoothing (limits jitter)
         smoothed_vad = (VAD_SMOOTHING * smoothed_vad) + ((1.0 - VAD_SMOOTHING) * raw_prob)
         last_vad_prob = float(max(0.0, min(1.0, smoothed_vad)))
 
@@ -454,7 +466,7 @@ def processing_worker():
                 threading.Thread(target=duck_volume, daemon=True).start()
         elif speech_active and last_vad_prob <= VAD_RELEASE:
             speech_active = False
-        # Otherwise, hold state (reduces chatter)
+        # Otherwise, hold state (reduces chatty toggling)
 
 # ---------------------------
 # 9) GUI
@@ -478,7 +490,7 @@ class DuckingApp:
         status = (
             f"MIC={MIC_DEVICE_ID}  REF={REF_DEVICE_ID}  "
             f"I/O={DEVICE_RATE}Hz  VAD={SAMPLE_RATE}Hz  "
-            f"Block={FRAME_SIZE} (→ {VAD_WINDOW_16K} @16k)  "
+            f"Block={FRAME_SIZE} (→ up to {VAD_WINDOW_16K} @16k)  "
             f"Attack={VAD_ATTACK:.2f} Release={VAD_RELEASE:.2f} Gain={GAIN_AFTER_AEC}x"
         )
         self.status_lbl = ttk.Label(root, text=status)
