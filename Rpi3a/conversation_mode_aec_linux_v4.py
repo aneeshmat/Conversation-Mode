@@ -72,7 +72,7 @@ FADE_STEP_MS = 30           # ms between fade steps
 VOLUME_RESTORE_TOL = 2      # +/- % tolerance to consider "unchanged" while ducked
 
 # NEW: how long of silence before we restore volume
-DUCK_HOLD_SILENCE = 0.7     # seconds of no speech before restore
+DUCK_HOLD_SILENCE = 1.3    # seconds of no speech before restore
 
 AEC_DELAY = 240
 
