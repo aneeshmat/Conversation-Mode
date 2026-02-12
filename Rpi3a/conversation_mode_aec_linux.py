@@ -35,11 +35,16 @@ from tkinter import ttk
 # ---------------------------
 MIC_DEVICE_ID = 5           # JLAB TALK MICROPHONE
 REF_DEVICE_ID = 12          # PipeWire monitor (reference)
+
 DEVICE_RATE = 48000         # hardware I/O rate (both mic & ref)
 SAMPLE_RATE = 16000         # Silero VAD expects 16 kHz
-FRAME_SIZE = 512            # device frames per callback (at 48k)
-VAD_WINDOW_16K = 512        # ~32 ms window for VAD stability
+
+# NOTE: At 48k, 32 ms = 1536 frames, which converts to exactly 512 samples @16k.
+# You can use FRAME_SIZE=1536 to get one VAD decision per callback with no accumulation.
+FRAME_SIZE = 512            # current device frames per callback (at 48k)
+VAD_WINDOW_16K = 512        # 32 ms window for Silero VAD
 VAD_THRESHOLD = 0.45        # speech probability threshold
+
 DUCK_LOW = 20               # percent
 DUCK_HIGH = 80              # percent
 DUCK_SECS = 2.5             # seconds
@@ -87,7 +92,6 @@ def _try_set_volume(control: str, percent: int) -> bool:
             capture_output=True,
             text=True
         )
-        # amixer returns 0 on success; we also check stderr for common errors
         return proc.returncode == 0 and "Unable to find simple control" not in proc.stderr
     except Exception:
         return False
@@ -102,9 +106,7 @@ def set_linux_volume(percent: int):
     for name in ["Master", "PCM", "Speaker", "Headphone"]:
         if _try_set_volume(name, percent):
             _already_picked_control = name
-            # print(f"[amixer] Using control: {name}")
             return
-    # Fallback: best effort on Master
     _try_set_volume("Master", percent)
 
 # ---------------------------
@@ -118,7 +120,6 @@ def setup_vad():
     global model, vad_session, USE_TORCH
     try:
         import torch
-        # Trust the repo to silence future warnings; cached after first download
         model, _ = torch.hub.load(
             repo_or_dir='snakers4/silero-vad',
             model='silero_vad',
@@ -151,8 +152,8 @@ def setup_vad():
 setup_vad()
 
 def vad_prob_16k(audio_16k: np.ndarray) -> float:
-    """Return speech probability for mono float32 16k signal."""
-    if audio_16k.size == 0:
+    """Return speech probability for mono float32 16k signal. Requires >=512 samples."""
+    if audio_16k.size < VAD_WINDOW_16K:
         return 0.0
     if USE_TORCH and model is not None:
         import torch
@@ -196,9 +197,9 @@ is_ducked = False
 # ref buffer at DEVICE_RATE (48k)
 ref_buffer = np.zeros(FRAME_SIZE, dtype=np.float32)
 
-# small VAD FIFO buffer at 16k (target ~32 ms)
-vad_buf = np.zeros(VAD_WINDOW_16K, dtype=np.float32)
-vad_filled = 0  # number of valid samples currently in vad_buf (<= VAD_WINDOW_16K)
+# Ring buffer at 16k for VAD; we only call VAD when full (>=512 samples)
+vad_ring = np.zeros(VAD_WINDOW_16K, dtype=np.float32)
+vad_filled = 0  # number of valid samples currently in vad_ring (0..512)
 
 def duck_volume():
     global is_ducked
@@ -227,7 +228,7 @@ def ref_callback(indata, frames, time_info, status):
 def mic_callback(indata, frames, time_info, status):
     if status:
         print("Mic status:", status)
-    global last_vad_prob, is_ducked, vad_buf, vad_filled
+    global last_vad_prob, is_ducked, vad_ring, vad_filled
 
     # Mic at device rate (48k)
     mic_raw_dev = indata[:, 0].astype(np.float32)
@@ -243,32 +244,37 @@ def mic_callback(indata, frames, time_info, status):
     else:
         cleaned_dev[:len(mic_raw_dev[:FRAME_SIZE])] = mic_raw_dev[:FRAME_SIZE]
 
-    # Resample to 16k for VAD
+    # Resample 48k -> 16k for VAD
     cleaned_16k = resample_linear(cleaned_dev, src_sr=DEVICE_RATE, dst_sr=SAMPLE_RATE)
 
-    # Accumulate in a small FIFO to give Silero ~32 ms context
+    # Append to the 16k ring buffer
     n = len(cleaned_16k)
     if n >= VAD_WINDOW_16K:
-        # take the last VAD_WINDOW_16K samples directly
-        vad_buf[:] = cleaned_16k[-VAD_WINDOW_16K:]
+        # take last VAD_WINDOW_16K samples directly
+        vad_ring[:] = cleaned_16k[-VAD_WINDOW_16K:]
         vad_filled = VAD_WINDOW_16K
     else:
         if vad_filled < VAD_WINDOW_16K:
             take = min(n, VAD_WINDOW_16K - vad_filled)
-            vad_buf[vad_filled:vad_filled+take] = cleaned_16k[:take]
+            vad_ring[vad_filled:vad_filled + take] = cleaned_16k[:take]
             vad_filled += take
-            # if still not full, we can compute on partial buffer
         else:
             # roll left and append at end
-            vad_buf = np.roll(vad_buf, -n)
-            vad_buf[-n:] = cleaned_16k
+            shift = n
+            if shift > 0:
+                vad_ring = np.roll(vad_ring, -shift)
+                vad_ring[-shift:] = cleaned_16k
 
-    # Compute VAD probability on whatever we have (full window preferred)
+    # Only call VAD when we have at least 512 samples (avoids "too short" error)
+    prob = last_vad_prob
     if vad_filled >= VAD_WINDOW_16K:
-        prob = vad_prob_16k(vad_buf)
-    else:
-        # partial window (startup)
-        prob = vad_prob_16k(vad_buf[:vad_filled]) if vad_filled > 0 else 0.0
+        try:
+            prob = vad_prob_16k(vad_ring)
+        except Exception as e:
+            # Guard against model raising inside audio thread
+            # Print once in a while if needed, but don't spam
+            # print(f"VAD error: {e}")
+            prob = last_vad_prob
 
     last_vad_prob = float(prob)
 
