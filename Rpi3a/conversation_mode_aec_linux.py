@@ -1,130 +1,374 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Conversation Mode - Linux (AEC + VAD + Volume Ducking + Tk GUI)
+
+- Mic: JLAB TALK MICROPHONE (device 5)
+- Ref: PipeWire monitor (device 12)
+- I/O at 48 kHz (device-native), resample to 16 kHz for Silero VAD
+- AEC runs at the device rate (48 kHz)
+- Volume ducking via ALSA (tries Master, PCM, Speaker, Headphone)
+
+Dependencies (typical):
+  pip install numpy sounddevice torch torchvision torchaudio packaging
+  # OR switch to ONNX (lighter): pip install onnxruntime
+
+Compile the C core:
+  gcc -O3 -fPIC -shared aec_core_vad.c -o aec_vad.so
+"""
+
+import os
+import sys
 import time
 import threading
+import subprocess
+import ctypes
+
 import numpy as np
 import sounddevice as sd
 import tkinter as tk
-from tkinter import messagebox, ttk
-import ctypes
-import subprocess
+from tkinter import ttk
 
 # ---------------------------
-# 1. SETTINGS
+# 1) SETTINGS (Tailored for your devices)
 # ---------------------------
-# Use 'sd.query_devices()' in terminal to find these IDs on your Pi/Zorin
-MIC_DEVICE_ID = 5  
-REF_DEVICE_ID = 12  
-SAMPLE_RATE = 16000
-FRAME_SIZE = 512
-DUCK_RATIO = 0.3  # Reduced to 30% volume
+MIC_DEVICE_ID = 5           # JLAB TALK MICROPHONE
+REF_DEVICE_ID = 12          # PipeWire monitor (reference)
+DEVICE_RATE = 48000         # hardware I/O rate (both mic & ref)
+SAMPLE_RATE = 16000         # Silero VAD expects 16 kHz
+FRAME_SIZE = 512            # device frames per callback (at 48k)
+VAD_WINDOW_16K = 512        # ~32 ms window for VAD stability
+VAD_THRESHOLD = 0.45        # speech probability threshold
+DUCK_LOW = 20               # percent
+DUCK_HIGH = 80              # percent
+DUCK_SECS = 2.5             # seconds
+
+# Optional: override via environment variables if needed
+MIC_DEVICE_ID = int(os.getenv("MIC_DEVICE_ID", MIC_DEVICE_ID))
+REF_DEVICE_ID = int(os.getenv("REF_DEVICE_ID", REF_DEVICE_ID))
 
 # ---------------------------
-# 2. LOAD C CORE (.so)
+# 2) LOAD AEC CORE (.so)
 # ---------------------------
-try:
-    # Look for .so instead of .dll
-    aec_lib = ctypes.CDLL("./aec_vad.so")
-    aec_lib.aec_process_buffer.argtypes = [
-        ctypes.c_void_p, 
-        np.ctypeslib.ndpointer(dtype=np.float32), 
-        np.ctypeslib.ndpointer(dtype=np.float32), 
-        np.ctypeslib.ndpointer(dtype=np.float32), 
-        ctypes.c_int, ctypes.c_int
-    ]
-    aec_lib.aec_create.restype = ctypes.c_void_p
-    aec_state = aec_lib.aec_create()
-    print("✅ AEC Shared Object Loaded")
-except Exception as e:
-    print(f"⚠️ AEC Core Failed: {e}")
-    aec_state = None
+aec_state = None
+aec_lib = None
 
-# ---------------------------
-# 3. LINUX VOLUME CONTROL (ALSA)
-# ---------------------------
-def set_linux_volume(percent):
-    """Sets system volume using amixer."""
+def load_aec_shared_object():
+    global aec_lib, aec_state
     try:
-        # 'Master' is the default. On some Pi DACs, it might be 'Headphone' or 'PCM'
-        subprocess.run(["amixer", "sset", "Master", f"{percent}%"], capture_output=True)
+        aec_lib = ctypes.CDLL("./aec_vad.so")
+        aec_lib.aec_process_buffer.argtypes = [
+            ctypes.c_void_p,
+            np.ctypeslib.ndpointer(dtype=np.float32),
+            np.ctypeslib.ndpointer(dtype=np.float32),
+            np.ctypeslib.ndpointer(dtype=np.float32),
+            ctypes.c_int, ctypes.c_int
+        ]
+        aec_lib.aec_create.restype = ctypes.c_void_p
+        aec_lib.aec_free.argtypes = [ctypes.c_void_p]
+        aec_state = aec_lib.aec_create()
+        print("✅ AEC Shared Object Loaded")
     except Exception as e:
-        print(f"Volume error: {e}")
+        print(f"⚠️ AEC Core Failed: {e}")
+        aec_state = None
+
+load_aec_shared_object()
 
 # ---------------------------
-# 4. VAD SETUP (Optimized)
+# 3) ALSA VOLUME CONTROL (auto-pick a mixer control)
 # ---------------------------
-# For Pi 3A, I highly recommend 'pip install onnxruntime' and using the .onnx model
-# But for now, here is the torch implementation adapted for Linux:
-import torch
-model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
+_already_picked_control = None
 
+def _try_set_volume(control: str, percent: int) -> bool:
+    try:
+        proc = subprocess.run(
+            ["amixer", "sset", control, f"{percent}%"],
+            capture_output=True,
+            text=True
+        )
+        # amixer returns 0 on success; we also check stderr for common errors
+        return proc.returncode == 0 and "Unable to find simple control" not in proc.stderr
+    except Exception:
+        return False
+
+def set_linux_volume(percent: int):
+    """Try a list of common ALSA simple controls and cache the first one that works."""
+    global _already_picked_control
+    percent = max(0, min(100, int(percent)))
+    if _already_picked_control:
+        _try_set_volume(_already_picked_control, percent)
+        return
+    for name in ["Master", "PCM", "Speaker", "Headphone"]:
+        if _try_set_volume(name, percent):
+            _already_picked_control = name
+            # print(f"[amixer] Using control: {name}")
+            return
+    # Fallback: best effort on Master
+    _try_set_volume("Master", percent)
+
+# ---------------------------
+# 4) VAD SETUP (Torch Silero with trust; optional ONNX fallback)
+# ---------------------------
+USE_TORCH = True
+model = None
+vad_session = None
+
+def setup_vad():
+    global model, vad_session, USE_TORCH
+    try:
+        import torch
+        # Trust the repo to silence future warnings; cached after first download
+        model, _ = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False,
+            trust_repo=True
+        )
+        model.eval()
+        USE_TORCH = True
+        print("✅ Silero VAD (Torch) loaded")
+    except Exception as e:
+        print(f"⚠️ Torch/Silero VAD load failed: {e}\n→ Trying ONNX Runtime fallback...")
+        try:
+            import onnxruntime as ort
+            import urllib.request
+            import pathlib
+            MODEL_PATH = pathlib.Path("silero_vad.onnx")
+            if not MODEL_PATH.exists():
+                print("Downloading Silero VAD ONNX model...")
+                urllib.request.urlretrieve(
+                    "https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.onnx",
+                    MODEL_PATH
+                )
+            vad_session = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
+            USE_TORCH = False
+            print("✅ Silero VAD (ONNX) loaded")
+        except Exception as e2:
+            print(f"❌ ONNX fallback failed: {e2}")
+            print("VAD unavailable. Speech detection will not work.")
+
+setup_vad()
+
+def vad_prob_16k(audio_16k: np.ndarray) -> float:
+    """Return speech probability for mono float32 16k signal."""
+    if audio_16k.size == 0:
+        return 0.0
+    if USE_TORCH and model is not None:
+        import torch
+        with torch.no_grad():
+            t = torch.from_numpy(audio_16k.astype(np.float32))
+            return float(model(t, SAMPLE_RATE).item())
+    elif (not USE_TORCH) and vad_session is not None:
+        inp_name = vad_session.get_inputs()[0].name
+        x = audio_16k.astype(np.float32)[None, :]
+        out = vad_session.run(None, {inp_name: x})[0]
+        return float(out.ravel()[0])
+    else:
+        return 0.0
+
+# ---------------------------
+# 5) LIGHTWEIGHT RESAMPLER (48k → 16k)
+# ---------------------------
+def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """1D linear resampler for short frames. x must be float32 mono."""
+    if src_sr == dst_sr:
+        return x
+    src_n = len(x)
+    if src_n == 0:
+        return np.zeros(0, dtype=np.float32)
+    dst_n = int(round(src_n * (dst_sr / src_sr)))
+    if dst_n <= 1:
+        return np.zeros(dst_n, dtype=np.float32)
+    src_idx = np.linspace(0, src_n - 1, num=dst_n, dtype=np.float32)
+    left = np.floor(src_idx).astype(np.int64)
+    right = np.minimum(left + 1, src_n - 1)
+    frac = src_idx - left
+    y = (1.0 - frac) * x[left] + frac * x[right]
+    return y.astype(np.float32)
+
+# ---------------------------
+# 6) GLOBALS FOR CALLBACKS
+# ---------------------------
 last_vad_prob = 0.0
 is_ducked = False
+
+# ref buffer at DEVICE_RATE (48k)
 ref_buffer = np.zeros(FRAME_SIZE, dtype=np.float32)
+
+# small VAD FIFO buffer at 16k (target ~32 ms)
+vad_buf = np.zeros(VAD_WINDOW_16K, dtype=np.float32)
+vad_filled = 0  # number of valid samples currently in vad_buf (<= VAD_WINDOW_16K)
 
 def duck_volume():
     global is_ducked
     is_ducked = True
-    set_linux_volume(20) # Duck down to 20%
-    time.sleep(2.5)      # Wait for user to finish speaking
-    set_linux_volume(80) # Back to normal
+    set_linux_volume(DUCK_LOW)
+    time.sleep(DUCK_SECS)
+    set_linux_volume(DUCK_HIGH)
     is_ducked = False
 
 # ---------------------------
-# 5. AUDIO CALLBACKS
+# 7) AUDIO CALLBACKS
 # ---------------------------
 def ref_callback(indata, frames, time_info, status):
+    if status:
+        print("Ref status:", status)
     global ref_buffer
-    ref_buffer[:] = indata[:, 0].astype(np.float32)
+    # keep reference at device rate (48k)
+    ref = indata[:, 0].astype(np.float32)
+    # ensure the buffer has FRAME_SIZE samples
+    if len(ref) >= FRAME_SIZE:
+        ref_buffer[:] = ref[:FRAME_SIZE]
+    else:
+        ref_buffer[:len(ref)] = ref
+        ref_buffer[len(ref):] = 0.0
 
 def mic_callback(indata, frames, time_info, status):
-    global last_vad_prob, is_ducked
-    mic_raw = indata[:, 0].astype(np.float32)
-    cleaned = np.zeros(FRAME_SIZE, dtype=np.float32)
+    if status:
+        print("Mic status:", status)
+    global last_vad_prob, is_ducked, vad_buf, vad_filled
 
-    if aec_state:
-        aec_lib.aec_process_buffer(aec_state, ref_buffer, mic_raw, cleaned, FRAME_SIZE, 0)
+    # Mic at device rate (48k)
+    mic_raw_dev = indata[:, 0].astype(np.float32)
+    cleaned_dev = np.zeros(FRAME_SIZE, dtype=np.float32)
+
+    # AEC operates at DEVICE_RATE (48k)
+    if aec_state is not None and aec_lib is not None:
+        aec_lib.aec_process_buffer(
+            aec_state, ref_buffer,
+            mic_raw_dev[:FRAME_SIZE],
+            cleaned_dev, FRAME_SIZE, 0
+        )
     else:
-        cleaned = mic_raw
+        cleaned_dev[:len(mic_raw_dev[:FRAME_SIZE])] = mic_raw_dev[:FRAME_SIZE]
 
-    audio_tensor = torch.from_numpy(cleaned)
-    prob = float(model(audio_tensor, SAMPLE_RATE).item())
-    last_vad_prob = prob
+    # Resample to 16k for VAD
+    cleaned_16k = resample_linear(cleaned_dev, src_sr=DEVICE_RATE, dst_sr=SAMPLE_RATE)
 
-    if prob > 0.45 and not is_ducked:
+    # Accumulate in a small FIFO to give Silero ~32 ms context
+    n = len(cleaned_16k)
+    if n >= VAD_WINDOW_16K:
+        # take the last VAD_WINDOW_16K samples directly
+        vad_buf[:] = cleaned_16k[-VAD_WINDOW_16K:]
+        vad_filled = VAD_WINDOW_16K
+    else:
+        if vad_filled < VAD_WINDOW_16K:
+            take = min(n, VAD_WINDOW_16K - vad_filled)
+            vad_buf[vad_filled:vad_filled+take] = cleaned_16k[:take]
+            vad_filled += take
+            # if still not full, we can compute on partial buffer
+        else:
+            # roll left and append at end
+            vad_buf = np.roll(vad_buf, -n)
+            vad_buf[-n:] = cleaned_16k
+
+    # Compute VAD probability on whatever we have (full window preferred)
+    if vad_filled >= VAD_WINDOW_16K:
+        prob = vad_prob_16k(vad_buf)
+    else:
+        # partial window (startup)
+        prob = vad_prob_16k(vad_buf[:vad_filled]) if vad_filled > 0 else 0.0
+
+    last_vad_prob = float(prob)
+
+    # Trigger ducking if speech detected
+    if last_vad_prob > VAD_THRESHOLD and not is_ducked:
         threading.Thread(target=duck_volume, daemon=True).start()
 
 # ---------------------------
-# 6. GUI
+# 8) GUI
 # ---------------------------
 class DuckingApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AEC + VAD (Linux/Pi)")
-        self.root.geometry("300x150")
+        self.root.title("AEC + VAD (Linux)")
+        self.root.geometry("360x180")
         self.running = False
-        
+        self.mic_stream = None
+        self.ref_stream = None
+
         self.btn = ttk.Button(root, text="Start Conversation Mode", command=self.toggle)
-        self.btn.pack(pady=20)
+        self.btn.pack(pady=16)
+
         self.prob_lbl = ttk.Label(root, text="Speech Prob: 0%")
         self.prob_lbl.pack()
+
+        self.status_lbl = ttk.Label(root, text=f"MIC={MIC_DEVICE_ID} REF={REF_DEVICE_ID} I/O={DEVICE_RATE}Hz VAD={SAMPLE_RATE}Hz")
+        self.status_lbl.pack(pady=8)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.update_ui()
 
     def toggle(self):
         if not self.running:
-            self.mic_stream = sd.InputStream(device=MIC_DEVICE_ID, channels=1, samplerate=SAMPLE_RATE, callback=mic_callback, blocksize=FRAME_SIZE)
-            self.ref_stream = sd.InputStream(device=REF_DEVICE_ID, channels=1, samplerate=SAMPLE_RATE, callback=ref_callback, blocksize=FRAME_SIZE)
-            self.mic_stream.start(); self.ref_stream.start()
+            # Try to open both streams at device rate (48k)
+            self.mic_stream = sd.InputStream(
+                device=MIC_DEVICE_ID, channels=1, samplerate=DEVICE_RATE,
+                callback=mic_callback, blocksize=FRAME_SIZE
+            )
+            self.ref_stream = sd.InputStream(
+                device=REF_DEVICE_ID, channels=1, samplerate=DEVICE_RATE,
+                callback=ref_callback, blocksize=FRAME_SIZE
+            )
+            self.mic_stream.start()
+            self.ref_stream.start()
             self.btn.config(text="Stop")
             self.running = True
         else:
-            self.mic_stream.stop(); self.ref_stream.stop()
-            self.btn.config(text="Start")
-            self.running = False
+            try:
+                if self.mic_stream:
+                    self.mic_stream.stop()
+                    self.mic_stream.close()
+                if self.ref_stream:
+                    self.ref_stream.stop()
+                    self.ref_stream.close()
+            finally:
+                self.mic_stream = None
+                self.ref_stream = None
+                self.btn.config(text="Start Conversation Mode")
+                self.running = False
 
     def update_ui(self):
-        self.prob_lbl.config(text=f"Speech Prob: {int(last_vad_prob * 100)}%")
+        pct = int(max(0.0, min(1.0, last_vad_prob)) * 100)
+        self.prob_lbl.config(text=f"Speech Prob: {pct}%")
         self.root.after(100, self.update_ui)
 
+    def on_close(self):
+        # Clean shutdown
+        if self.running:
+            try:
+                if self.mic_stream:
+                    self.mic_stream.stop()
+                    self.mic_stream.close()
+                if self.ref_stream:
+                    self.ref_stream.stop()
+                    self.ref_stream.close()
+            except Exception:
+                pass
+        # Free AEC state
+        try:
+            if aec_state is not None and aec_lib is not None:
+                aec_lib.aec_free(aec_state)
+        except Exception:
+            pass
+        self.root.destroy()
+
+# ---------------------------
+# 9) MAIN
+# ---------------------------
 if __name__ == "__main__":
+    # Optional: print device summary once
+    try:
+        devs = sd.query_devices()
+        print("\nAvailable devices:")
+        for i, d in enumerate(devs):
+            star = "*" if i == sd.default.device[0] or i == sd.default.device[1] else " "
+            print(f"{star} {i:2d} {d['name']}, {d['hostapi']} ({d['max_input_channels']} in, {d['max_output_channels']} out)")
+        print()
+    except Exception as e:
+        print(f"Device enumeration failed: {e}")
+
     root = tk.Tk()
     app = DuckingApp(root)
     root.mainloop()
