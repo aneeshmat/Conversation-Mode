@@ -41,7 +41,7 @@ SAMPLE_RATE = 16000         # Silero VAD expects 16 kHz
 
 # NOTE: At 48k, 32 ms = 1536 frames, which converts to exactly 512 samples @16k.
 # You can use FRAME_SIZE=1536 to get one VAD decision per callback with no accumulation.
-FRAME_SIZE = 512            # current device frames per callback (at 48k)
+FRAME_SIZE = 1536            # current device frames per callback (at 48k)
 VAD_WINDOW_16K = 512        # 32 ms window for Silero VAD
 VAD_THRESHOLD = 0.45        # speech probability threshold
 
