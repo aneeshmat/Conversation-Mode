@@ -1,3 +1,4 @@
+import sounddevice as sd
 device_id = 12  # pipewire
 for sr in [48000, 44100, 32000, 22050, 16000]:
     try:
