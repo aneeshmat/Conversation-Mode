@@ -8,11 +8,15 @@ Conversation Mode - Linux (AEC + VAD + Volume Ducking + Tk GUI)
 - Ref: PipeWire monitor (device 12)
 - I/O at 48 kHz (device-native), resample to 16 kHz for Silero VAD
 - AEC runs at the device rate (48 kHz)
-- Volume ducking via ALSA (tries Master, PCM, Speaker, Headphone)
+- Heavy work moved off the audio callback to a worker thread
+- Volume ducking via ALSA (auto-picks Master/PCM/Speaker/Headphone)
 
-Dependencies (typical):
-  pip install numpy sounddevice torch torchvision torchaudio packaging
-  # OR switch to ONNX (lighter): pip install onnxruntime
+Dependencies:
+  pip install numpy sounddevice packaging
+  # For Torch VAD (current setup):
+  pip install torch torchvision torchaudio
+  # OR lighter fallback:
+  pip install onnxruntime
 
 Compile the C core:
   gcc -O3 -fPIC -shared aec_core_vad.c -o aec_vad.so
@@ -24,6 +28,7 @@ import time
 import threading
 import subprocess
 import ctypes
+import queue
 
 import numpy as np
 import sounddevice as sd
@@ -39,9 +44,8 @@ REF_DEVICE_ID = 12          # PipeWire monitor (reference)
 DEVICE_RATE = 48000         # hardware I/O rate (both mic & ref)
 SAMPLE_RATE = 16000         # Silero VAD expects 16 kHz
 
-# NOTE: At 48k, 32 ms = 1536 frames, which converts to exactly 512 samples @16k.
-# You can use FRAME_SIZE=1536 to get one VAD decision per callback with no accumulation.
-FRAME_SIZE = 1536            # current device frames per callback (at 48k)
+# Use 1536 frames at 48k (= 32 ms), which resamples exactly to 512 @ 16k.
+FRAME_SIZE = 1536
 VAD_WINDOW_16K = 512        # 32 ms window for Silero VAD
 VAD_THRESHOLD = 0.45        # speech probability threshold
 
@@ -49,9 +53,12 @@ DUCK_LOW = 20               # percent
 DUCK_HIGH = 80              # percent
 DUCK_SECS = 2.5             # seconds
 
-# Optional: override via environment variables if needed
+# Optional: override via env vars
 MIC_DEVICE_ID = int(os.getenv("MIC_DEVICE_ID", MIC_DEVICE_ID))
 REF_DEVICE_ID = int(os.getenv("REF_DEVICE_ID", REF_DEVICE_ID))
+
+# Prefer higher latency to avoid overflows on Linux/PipeWire/ALSA
+sd.default.latency = "high"   # or tuple: (0.12, 0.12)
 
 # ---------------------------
 # 2) LOAD AEC CORE (.so)
@@ -107,7 +114,7 @@ def set_linux_volume(percent: int):
         if _try_set_volume(name, percent):
             _already_picked_control = name
             return
-    _try_set_volume("Master", percent)
+    _try_set_volume("Master", percent)  # best-effort fallback
 
 # ---------------------------
 # 4) VAD SETUP (Torch Silero with trust; optional ONNX fallback)
@@ -120,6 +127,7 @@ def setup_vad():
     global model, vad_session, USE_TORCH
     try:
         import torch
+        # Trust repo to silence future warnings; uses cache after first download
         model, _ = torch.hub.load(
             repo_or_dir='snakers4/silero-vad',
             model='silero_vad',
@@ -150,6 +158,11 @@ def setup_vad():
             print("VAD unavailable. Speech detection will not work.")
 
 setup_vad()
+
+def warmup_vad():
+    """Warm the model once to avoid a compute spike right after streams start."""
+    dummy = np.zeros(VAD_WINDOW_16K, dtype=np.float32)
+    _ = vad_prob_16k(dummy)
 
 def vad_prob_16k(audio_16k: np.ndarray) -> float:
     """Return speech probability for mono float32 16k signal. Requires >=512 samples."""
@@ -189,17 +202,17 @@ def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return y.astype(np.float32)
 
 # ---------------------------
-# 6) GLOBALS FOR CALLBACKS
+# 6) GLOBALS (Queues, Buffers)
 # ---------------------------
 last_vad_prob = 0.0
 is_ducked = False
 
-# ref buffer at DEVICE_RATE (48k)
+# Reference buffer at DEVICE_RATE (48k), length = FRAME_SIZE
 ref_buffer = np.zeros(FRAME_SIZE, dtype=np.float32)
 
-# Ring buffer at 16k for VAD; we only call VAD when full (>=512 samples)
-vad_ring = np.zeros(VAD_WINDOW_16K, dtype=np.float32)
-vad_filled = 0  # number of valid samples currently in vad_ring (0..512)
+# Worker queue: each item is (mic_frame_48k, ref_frame_48k)
+audio_q = queue.Queue(maxsize=16)
+running_worker = False
 
 def duck_volume():
     global is_ducked
@@ -210,7 +223,7 @@ def duck_volume():
     is_ducked = False
 
 # ---------------------------
-# 7) AUDIO CALLBACKS
+# 7) AUDIO CALLBACKS (lightweight)
 # ---------------------------
 def ref_callback(indata, frames, time_info, status):
     if status:
@@ -218,81 +231,75 @@ def ref_callback(indata, frames, time_info, status):
     global ref_buffer
     # keep reference at device rate (48k)
     ref = indata[:, 0].astype(np.float32)
-    # ensure the buffer has FRAME_SIZE samples
     if len(ref) >= FRAME_SIZE:
         ref_buffer[:] = ref[:FRAME_SIZE]
     else:
+        # shouldn't happen with fixed blocksize, but keep safe
         ref_buffer[:len(ref)] = ref
         ref_buffer[len(ref):] = 0.0
 
 def mic_callback(indata, frames, time_info, status):
     if status:
         print("Mic status:", status)
-    global last_vad_prob, is_ducked, vad_ring, vad_filled
-
-    # Mic at device rate (48k)
-    mic_raw_dev = indata[:, 0].astype(np.float32)
-    cleaned_dev = np.zeros(FRAME_SIZE, dtype=np.float32)
-
-    # AEC operates at DEVICE_RATE (48k)
-    if aec_state is not None and aec_lib is not None:
-        aec_lib.aec_process_buffer(
-            aec_state, ref_buffer,
-            mic_raw_dev[:FRAME_SIZE],
-            cleaned_dev, FRAME_SIZE, 0
-        )
-    else:
-        cleaned_dev[:len(mic_raw_dev[:FRAME_SIZE])] = mic_raw_dev[:FRAME_SIZE]
-
-    # Resample 48k -> 16k for VAD
-    cleaned_16k = resample_linear(cleaned_dev, src_sr=DEVICE_RATE, dst_sr=SAMPLE_RATE)
-
-    # Append to the 16k ring buffer
-    n = len(cleaned_16k)
-    if n >= VAD_WINDOW_16K:
-        # take last VAD_WINDOW_16K samples directly
-        vad_ring[:] = cleaned_16k[-VAD_WINDOW_16K:]
-        vad_filled = VAD_WINDOW_16K
-    else:
-        if vad_filled < VAD_WINDOW_16K:
-            take = min(n, VAD_WINDOW_16K - vad_filled)
-            vad_ring[vad_filled:vad_filled + take] = cleaned_16k[:take]
-            vad_filled += take
-        else:
-            # roll left and append at end
-            shift = n
-            if shift > 0:
-                vad_ring = np.roll(vad_ring, -shift)
-                vad_ring[-shift:] = cleaned_16k
-
-    # Only call VAD when we have at least 512 samples (avoids "too short" error)
-    prob = last_vad_prob
-    if vad_filled >= VAD_WINDOW_16K:
+    mic_frame = indata[:, 0].astype(np.float32).copy()   # 48k, FRAME_SIZE
+    ref_frame = ref_buffer.copy()                         # 48k, FRAME_SIZE
+    try:
+        audio_q.put_nowait((mic_frame, ref_frame))
+    except queue.Full:
+        # Drop oldest by pulling one, then push (keeps latency bounded)
         try:
-            prob = vad_prob_16k(vad_ring)
-        except Exception as e:
-            # Guard against model raising inside audio thread
-            # Print once in a while if needed, but don't spam
-            # print(f"VAD error: {e}")
-            prob = last_vad_prob
-
-    last_vad_prob = float(prob)
-
-    # Trigger ducking if speech detected
-    if last_vad_prob > VAD_THRESHOLD and not is_ducked:
-        threading.Thread(target=duck_volume, daemon=True).start()
+            _ = audio_q.get_nowait()
+            audio_q.put_nowait((mic_frame, ref_frame))
+        except Exception:
+            pass
 
 # ---------------------------
-# 8) GUI
+# 8) PROCESSING WORKER (AEC → resample → VAD → duck)
+# ---------------------------
+def processing_worker():
+    global last_vad_prob, is_ducked, running_worker
+    while running_worker:
+        try:
+            mic_dev, ref_dev = audio_q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        # AEC @ 48k (FRAME_SIZE samples)
+        cleaned_dev = np.zeros_like(mic_dev, dtype=np.float32)
+        if aec_state is not None and aec_lib is not None:
+            aec_lib.aec_process_buffer(aec_state, ref_dev, mic_dev, cleaned_dev, FRAME_SIZE, 0)
+        else:
+            cleaned_dev[:] = mic_dev
+
+        # Resample 48k → 16k (with FRAME_SIZE=1536 this is exactly 512 samples)
+        cleaned_16k = resample_linear(cleaned_dev, src_sr=DEVICE_RATE, dst_sr=SAMPLE_RATE)
+
+        # VAD (expect >= 512 samples)
+        prob = last_vad_prob
+        try:
+            if cleaned_16k.size >= VAD_WINDOW_16K:
+                prob = vad_prob_16k(cleaned_16k[-VAD_WINDOW_16K:])
+        except Exception:
+            pass
+
+        last_vad_prob = float(prob)
+
+        # Trigger ducking if speech detected
+        if last_vad_prob > VAD_THRESHOLD and not is_ducked:
+            threading.Thread(target=duck_volume, daemon=True).start()
+
+# ---------------------------
+# 9) GUI
 # ---------------------------
 class DuckingApp:
     def __init__(self, root):
         self.root = root
         self.root.title("AEC + VAD (Linux)")
-        self.root.geometry("360x180")
+        self.root.geometry("380x200")
         self.running = False
         self.mic_stream = None
         self.ref_stream = None
+        self.worker_thr = None
 
         self.btn = ttk.Button(root, text="Start Conversation Mode", command=self.toggle)
         self.btn.pack(pady=16)
@@ -300,38 +307,59 @@ class DuckingApp:
         self.prob_lbl = ttk.Label(root, text="Speech Prob: 0%")
         self.prob_lbl.pack()
 
-        self.status_lbl = ttk.Label(root, text=f"MIC={MIC_DEVICE_ID} REF={REF_DEVICE_ID} I/O={DEVICE_RATE}Hz VAD={SAMPLE_RATE}Hz")
+        self.status_lbl = ttk.Label(
+            root,
+            text=f"MIC={MIC_DEVICE_ID}  REF={REF_DEVICE_ID}  I/O={DEVICE_RATE}Hz  VAD={SAMPLE_RATE}Hz  Block={FRAME_SIZE}"
+        )
         self.status_lbl.pack(pady=8)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.update_ui()
 
     def toggle(self):
+        global running_worker
+
         if not self.running:
-            # Try to open both streams at device rate (48k)
+            # Warm up VAD before starting audio to avoid spikes
+            warmup_vad()
+
+            # Start processing worker
+            running_worker = True
+            self.worker_thr = threading.Thread(target=processing_worker, daemon=True)
+            self.worker_thr.start()
+
+            # Open both streams at device rate (48k) with float32
             self.mic_stream = sd.InputStream(
                 device=MIC_DEVICE_ID, channels=1, samplerate=DEVICE_RATE,
-                callback=mic_callback, blocksize=FRAME_SIZE
+                callback=mic_callback, blocksize=FRAME_SIZE,
+                dtype='float32', latency="high"
             )
             self.ref_stream = sd.InputStream(
                 device=REF_DEVICE_ID, channels=1, samplerate=DEVICE_RATE,
-                callback=ref_callback, blocksize=FRAME_SIZE
+                callback=ref_callback, blocksize=FRAME_SIZE,
+                dtype='float32', latency="high"
             )
             self.mic_stream.start()
             self.ref_stream.start()
             self.btn.config(text="Stop")
             self.running = True
+
         else:
+            # Stop streams
             try:
                 if self.mic_stream:
-                    self.mic_stream.stop()
-                    self.mic_stream.close()
+                    self.mic_stream.stop(); self.mic_stream.close()
                 if self.ref_stream:
-                    self.ref_stream.stop()
-                    self.ref_stream.close()
+                    self.ref_stream.stop(); self.ref_stream.close()
             finally:
                 self.mic_stream = None
                 self.ref_stream = None
+                # Stop worker
+                running_worker = False
+                # Drain queue quickly to let thread exit
+                while not audio_q.empty():
+                    try: audio_q.get_nowait()
+                    except Exception: break
                 self.btn.config(text="Start Conversation Mode")
                 self.running = False
 
@@ -345,13 +373,19 @@ class DuckingApp:
         if self.running:
             try:
                 if self.mic_stream:
-                    self.mic_stream.stop()
-                    self.mic_stream.close()
+                    self.mic_stream.stop(); self.mic_stream.close()
                 if self.ref_stream:
-                    self.ref_stream.stop()
-                    self.ref_stream.close()
+                    self.ref_stream.stop(); self.ref_stream.close()
             except Exception:
                 pass
+        # Stop worker
+        global running_worker
+        running_worker = False
+        try:
+            while not audio_q.empty():
+                audio_q.get_nowait()
+        except Exception:
+            pass
         # Free AEC state
         try:
             if aec_state is not None and aec_lib is not None:
@@ -361,7 +395,7 @@ class DuckingApp:
         self.root.destroy()
 
 # ---------------------------
-# 9) MAIN
+# 10) MAIN
 # ---------------------------
 if __name__ == "__main__":
     # Optional: print device summary once
