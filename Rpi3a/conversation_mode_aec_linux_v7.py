@@ -1,17 +1,12 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
 Conversation Mode - Linux (AEC + VAD + Relative Smooth Ducking + Tk GUI)
 
-- Mic: JLAB TALK MICROPHONE (device 5)
-- Ref: PipeWire monitor (device 12)
-- I/O at 48 kHz (device-native), resample to 16 kHz for Silero VAD
-- AEC runs at the device rate (48 kHz)
-- Ducking:
-    * Ducks to (current volume × DUCK_RATIO) with smooth fades when speech starts
-    * STAYS ducked as long as speech continues
-    * Restores (with smooth fade) only after DUCK_HOLD_SILENCE of no speech
-    * If the user changes volume while ducked, we respect it
-- VAD is gated so that frames dominated by speaker output or echo-like content
-  do NOT trigger speech
+Goal now: be aggressively conservative.
+- VAD should stay near 0% on music/lyrics.
+- Only clear, near-field mic speech should trigger ducking.
 """
 
 import os
@@ -39,9 +34,9 @@ SAMPLE_RATE = 16000
 
 FRAME_SIZE = 3072           # 64 ms @ 48k
 VAD_WINDOW_16K = 1024       # 64 ms @ 16k
-VAD_THRESHOLD = 0.45
 
-VAD_ATTACK = 0.60
+# Make VAD harder to trigger
+VAD_ATTACK = 0.80           # was 0.60
 VAD_RELEASE = 0.35
 VAD_SMOOTHING = 0.6
 
@@ -70,7 +65,7 @@ aec_lib = None
 def load_aec_shared_object():
     global aec_lib, aec_state
     try:
-        aec_lib = ctypes.CDLL("./aec_vad_v2.so")
+        aec_lib = ctypes.CDLL("./aec_vad.so")
         aec_lib.aec_process_buffer.argtypes = [
             ctypes.c_void_p,
             np.ctypeslib.ndpointer(dtype=np.float32),
@@ -425,16 +420,21 @@ def processing_worker():
 
         cleaned_dev = highpass_dc_block(cleaned_dev, alpha=HP_ALPHA)
 
-        # --- RMS gate: suppress VAD when reference dominates energy ---
+        # --- Energy metrics ---
         mic_rms = float(np.sqrt(np.mean(cleaned_dev**2) + 1e-9))
         ref_rms = float(np.sqrt(np.mean(ref_dev**2) + 1e-9))
-        ref_dominates = (ref_rms > 0.0 and mic_rms < 0.7 * ref_rms)
 
-        # --- Coherence gate: suppress VAD when cleaned signal is echo-like ---
+        # 1) Absolute floor: if mic is very quiet, never call VAD
+        too_quiet = mic_rms < 0.01
+
+        # 2) RMS gate: suppress VAD when reference dominates
+        ref_dominates = (ref_rms > 0.0 and mic_rms < 0.5 * ref_rms)  # stricter
+
+        # 3) Coherence gate: suppress VAD when cleaned signal is echo-like
         mic_norm = cleaned_dev / (np.linalg.norm(cleaned_dev) + 1e-9)
         ref_norm = ref_dev / (np.linalg.norm(ref_dev) + 1e-9)
         coherence = float(np.dot(mic_norm, ref_norm))
-        echo_like = coherence > 0.35
+        echo_like = coherence > 0.25  # stricter
 
         cleaned_16k = resample_linear(cleaned_dev,
                                       src_sr=DEVICE_RATE,
@@ -444,13 +444,17 @@ def processing_worker():
             cleaned_16k = cleaned_16k * np.float32(GAIN_AFTER_AEC)
 
         raw_prob = 0.0
-        if cleaned_16k.size >= 512 and not ref_dominates and not echo_like:
+        if cleaned_16k.size >= 512 and not too_quiet and not ref_dominates and not echo_like:
             raw_prob = vad_prob_16k(cleaned_16k[-VAD_WINDOW_16K:])
 
         smoothed_vad = (VAD_SMOOTHING * smoothed_vad) + ((1.0 - VAD_SMOOTHING) * raw_prob)
         last_vad_prob = float(max(0.0, min(1.0, smoothed_vad)))
 
-        if last_vad_prob >= VAD_ATTACK:
+        # 4) Hard clamp: if reference is active and VAD is high, zero it
+        if ref_rms > 0.01 and last_vad_prob > 0.3:
+            last_vad_prob = 0.0
+
+        if last_vad_prob >= VAD_ATTACK and mic_rms >= 0.02 and mic_rms > ref_rms:
             duck_ctrl.notify_speech()
 
         duck_ctrl.update()
