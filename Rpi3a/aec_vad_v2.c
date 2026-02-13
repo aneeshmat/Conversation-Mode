@@ -1,35 +1,37 @@
 // Save as aec_core_vad.c
-// Compile (Linux):
+// Linux:
 //   gcc -O3 -fPIC -shared aec_core_vad.c -o aec_vad.so -lm
 
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-#define FILTER_LEN 1024
+#define FILTER_LEN 1024        // ~21 ms at 48 kHz
 #define MAX_DELAY  8192
 #define MASK       (MAX_DELAY - 1)
-#define DTD_WINDOW 128
+#define DTD_WINDOW 128         // RMS window for double-talk detection
 
 typedef struct {
-    float w[FILTER_LEN];
-    float x[MAX_DELAY];
-    int pos;
+    float w[FILTER_LEN];       // adaptive filter taps
+    float x[MAX_DELAY];        // circular buffer for reference
+    int   pos;
 
     float mic_hist[DTD_WINDOW];
     float spk_hist[DTD_WINDOW];
-    int hist_pos;
+    int   hist_pos;
 } AEC_State;
 
 #ifdef _WIN32
-#define EXPORT __declspec(dllexport)
+    #define EXPORT __declspec(dllexport)
 #else
-#define EXPORT __attribute__((visibility("default")))
+    #define EXPORT __attribute__((visibility("default")))
 #endif
 
 EXPORT AEC_State* aec_create() {
     AEC_State* s = (AEC_State*)malloc(sizeof(AEC_State));
-    if (s) memset(s, 0, sizeof(AEC_State));
+    if (s) {
+        memset(s, 0, sizeof(AEC_State));
+    }
     return s;
 }
 
@@ -45,21 +47,24 @@ EXPORT void aec_process_buffer(AEC_State* s,
 
     for (int j = 0; j < len; j++) {
 
+        // write reference sample
         s->x[s->pos] = speaker_buf[j];
         int ref_idx = (s->pos - delay + MAX_DELAY) & MASK;
 
-        float y = 0.0f;
+        // echo estimate + reference energy
+        float y      = 0.0f;
         float energy = eps;
-
         for (int i = 0; i < FILTER_LEN; i++) {
             float xi = s->x[(ref_idx - i + MAX_DELAY) & MASK];
-            y += s->w[i] * xi;
+            y      += s->w[i] * xi;
             energy += xi * xi;
         }
 
+        // error
         float e = mic_buf[j] - y;
         out_buf[j] = e;
 
+        // --- RMS-based double-talk detection ---
         s->mic_hist[s->hist_pos] = mic_buf[j];
         s->spk_hist[s->hist_pos] = speaker_buf[j];
         s->hist_pos = (s->hist_pos + 1) % DTD_WINDOW;
@@ -72,6 +77,7 @@ EXPORT void aec_process_buffer(AEC_State* s,
         mic_rms = sqrtf(mic_rms / DTD_WINDOW);
         spk_rms = sqrtf(spk_rms / DTD_WINDOW);
 
+        // adapt only when reference dominates
         int allow_adapt = (spk_rms > 0.0001f) && (mic_rms < 3.0f * spk_rms);
 
         if (allow_adapt) {
