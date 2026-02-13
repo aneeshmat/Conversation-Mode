@@ -65,7 +65,7 @@ aec_lib = None
 def load_aec_shared_object():
     global aec_lib, aec_state
     try:
-        aec_lib = ctypes.CDLL("./aec_vad.so")
+        aec_lib = ctypes.CDLL("./aec_vad_v2.so")
         aec_lib.aec_process_buffer.argtypes = [
             ctypes.c_void_p,
             np.ctypeslib.ndpointer(dtype=np.float32),
