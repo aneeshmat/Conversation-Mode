@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FILTER_LEN 512 
+#define FILTER_LEN 2048 
 #define MAX_DELAY 8192 
 #define MASK (MAX_DELAY - 1)
 
