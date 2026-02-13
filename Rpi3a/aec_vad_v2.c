@@ -1,20 +1,23 @@
-// Save as aec_core_vad.c and compile with:
+// Save as aec_core_vad.c
+// Compile with:
 // gcc -O3 -fPIC -shared aec_core_vad.c -o aec_vad.so -lm
 
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-#define FILTER_LEN 1024
+#define FILTER_LEN 1024        // longer filter = better echo suppression
 #define MAX_DELAY  8192
 #define MASK       (MAX_DELAY - 1)
-#define DTD_WINDOW 128
+
+#define DTD_WINDOW 128         // RMS window for double-talk detection
 
 typedef struct {
-    float w[FILTER_LEN];
-    float x[MAX_DELAY];
+    float w[FILTER_LEN];       // adaptive filter taps
+    float x[MAX_DELAY];        // circular buffer for reference signal
     int pos;
 
+    // NEW: short-term RMS history for double-talk detection
     float mic_hist[DTD_WINDOW];
     float spk_hist[DTD_WINDOW];
     int hist_pos;
@@ -40,13 +43,13 @@ EXPORT void aec_process_buffer(AEC_State* s,
                                float* out_buf,
                                int len,
                                int delay) {
-    float mu   = 0.02f;
-    float leak = 0.9995f;
-    float eps  = 0.001f;
+    float mu   = 0.02f;        // NLMS learning rate
+    float leak = 0.9995f;      // leakage to prevent coefficient blow-up
+    float eps  = 0.001f;       // avoids divide-by-zero
 
     for (int j = 0; j < len; j++) {
 
-        // Write reference sample
+        // Write reference sample into circular buffer
         s->x[s->pos] = speaker_buf[j];
         int ref_idx = (s->pos - delay + MAX_DELAY) & MASK;
 
@@ -59,15 +62,17 @@ EXPORT void aec_process_buffer(AEC_State* s,
             energy += xi * xi;
         }
 
+        // Error = mic - predicted echo
         float e = mic_buf[j] - y;
         out_buf[j] = e;
 
-        // Update RMS history
+        // -------------------------------
+        // NEW: RMS-based double-talk detection
+        // -------------------------------
         s->mic_hist[s->hist_pos] = mic_buf[j];
         s->spk_hist[s->hist_pos] = speaker_buf[j];
         s->hist_pos = (s->hist_pos + 1) % DTD_WINDOW;
 
-        // Compute RMS
         float mic_rms = 0.0f, spk_rms = 0.0f;
         for (int k = 0; k < DTD_WINDOW; k++) {
             mic_rms += s->mic_hist[k] * s->mic_hist[k];
@@ -76,9 +81,12 @@ EXPORT void aec_process_buffer(AEC_State* s,
         mic_rms = sqrtf(mic_rms / DTD_WINDOW);
         spk_rms = sqrtf(spk_rms / DTD_WINDOW);
 
-        // Double-talk protection
+        // Allow adaptation only when reference dominates
         int allow_adapt = (spk_rms > 0.0001f) && (mic_rms < 3.0f * spk_rms);
 
+        // -------------------------------
+        // NLMS adaptation (only if allowed)
+        // -------------------------------
         if (allow_adapt) {
             float step = (mu * e) / energy;
             for (int i = 0; i < FILTER_LEN; i++) {
@@ -87,6 +95,7 @@ EXPORT void aec_process_buffer(AEC_State* s,
             }
         }
 
+        // Advance circular buffer pointer
         s->pos = (s->pos + 1) & MASK;
     }
 }
