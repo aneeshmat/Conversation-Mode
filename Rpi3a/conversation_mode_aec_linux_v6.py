@@ -159,11 +159,7 @@ def _amixer_get_volume() -> int:
             capture_output=True, text=True, timeout=1.5
         )
         if out.returncode == 0:
-            m = re.search(r'
-
-\[(\d+)%\]
-
-', out.stdout)
+            m = re.search(r'\[(\d+)%\]', out.stdout)
             if m:
                 return int(m.group(1))
     except Exception:
