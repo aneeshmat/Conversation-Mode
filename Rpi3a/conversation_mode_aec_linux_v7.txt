@@ -1,12 +1,12 @@
-"""
-Conversation Mode - Linux (AEC + VAD + ML Voice Classifier + Relative Smooth Ducking + Tk GUI)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-- Mic: JLAB TALK MICROPHONE (device 5)
-- Ref: PipeWire monitor (device 12)
-- I/O at 48 kHz (device-native), resample to 16 kHz for Silero VAD
-- AEC runs at the device rate (48 kHz)
-- Tiny ML classifier decides "my voice vs echo/music"
-- VAD is only trusted when classifier says "my voice"
+"""
+Conversation Mode - Linux (AEC + VAD + Relative Smooth Ducking + Tk GUI)
+
+Goal now: be aggressively conservative.
+- VAD should stay near 0% on music/lyrics.
+- Only clear, near-field mic speech should trigger ducking.
 """
 
 import os
@@ -23,9 +23,6 @@ import sounddevice as sd
 import tkinter as tk
 from tkinter import ttk
 
-# ---- import your classifier hook ----
-from classifier_inference import classifier_prob  # expects classifier_prob(cleaned_dev, ref_dev)
-
 # ---------------------------
 # 1) SETTINGS
 # ---------------------------
@@ -38,7 +35,8 @@ SAMPLE_RATE = 16000
 FRAME_SIZE = 3072           # 64 ms @ 48k
 VAD_WINDOW_16K = 1024       # 64 ms @ 16k
 
-VAD_ATTACK = 0.80           # conservative
+# Make VAD harder to trigger
+VAD_ATTACK = 0.80           # was 0.60
 VAD_RELEASE = 0.35
 VAD_SMOOTHING = 0.6
 
@@ -67,7 +65,7 @@ aec_lib = None
 def load_aec_shared_object():
     global aec_lib, aec_state
     try:
-        aec_lib = ctypes.CDLL("./aec_vad.so")
+        aec_lib = ctypes.CDLL("./aec_vad_v2.so")
         aec_lib.aec_process_buffer.argtypes = [
             ctypes.c_void_p,
             np.ctypeslib.ndpointer(dtype=np.float32),
@@ -206,7 +204,7 @@ def smooth_set_volume(from_p: int, to_p: int,
         time.sleep(step_ms / 1000.0)
 
 # ---------------------------
-# 4) VAD SETUP (Silero)
+# 4) VAD SETUP
 # ---------------------------
 USE_TORCH = True
 model = None
@@ -400,7 +398,7 @@ def mic_callback(indata, frames, time_info, status):
             pass
 
 # ---------------------------
-# 9) PROCESSING WORKER (AEC → HP → classifier → VAD → duck)
+# 9) PROCESSING WORKER
 # ---------------------------
 def processing_worker():
     global last_vad_prob, smoothed_vad, running_worker
@@ -411,7 +409,6 @@ def processing_worker():
             duck_ctrl.update()
             continue
 
-        # AEC
         cleaned_dev = np.zeros_like(mic_dev, dtype=np.float32)
         if aec_state is not None and aec_lib is not None:
             aec_lib.aec_process_buffer(aec_state,
@@ -421,14 +418,24 @@ def processing_worker():
         else:
             cleaned_dev[:] = mic_dev
 
-        # High-pass
         cleaned_dev = highpass_dc_block(cleaned_dev, alpha=HP_ALPHA)
 
-        # Basic energy metrics (optional, can be used for extra gating)
+        # --- Energy metrics ---
         mic_rms = float(np.sqrt(np.mean(cleaned_dev**2) + 1e-9))
         ref_rms = float(np.sqrt(np.mean(ref_dev**2) + 1e-9))
 
-        # Downsample for VAD
+        # 1) Absolute floor: if mic is very quiet, never call VAD
+        too_quiet = mic_rms < 0.01
+
+        # 2) RMS gate: suppress VAD when reference dominates
+        ref_dominates = (ref_rms > 0.0 and mic_rms < 0.5 * ref_rms)  # stricter
+
+        # 3) Coherence gate: suppress VAD when cleaned signal is echo-like
+        mic_norm = cleaned_dev / (np.linalg.norm(cleaned_dev) + 1e-9)
+        ref_norm = ref_dev / (np.linalg.norm(ref_dev) + 1e-9)
+        coherence = float(np.dot(mic_norm, ref_norm))
+        echo_like = coherence > 0.25  # stricter
+
         cleaned_16k = resample_linear(cleaned_dev,
                                       src_sr=DEVICE_RATE,
                                       dst_sr=SAMPLE_RATE)
@@ -436,23 +443,17 @@ def processing_worker():
         if GAIN_AFTER_AEC != 1.0:
             cleaned_16k = cleaned_16k * np.float32(GAIN_AFTER_AEC)
 
-        # ---- ML classifier: my voice vs echo/music ----
-        p_cls = classifier_prob(cleaned_dev, ref_dev)
-
-        # If classifier says "not my voice", force VAD to 0
         raw_prob = 0.0
-        if cleaned_16k.size >= 512 and p_cls >= 0.8:
+        if cleaned_16k.size >= 512 and not too_quiet and not ref_dominates and not echo_like:
             raw_prob = vad_prob_16k(cleaned_16k[-VAD_WINDOW_16K:])
 
-        # Smooth VAD
         smoothed_vad = (VAD_SMOOTHING * smoothed_vad) + ((1.0 - VAD_SMOOTHING) * raw_prob)
         last_vad_prob = float(max(0.0, min(1.0, smoothed_vad)))
 
-        # Optional: extra sanity clamp if ref is loud
-        if ref_rms > 0.01 and last_vad_prob > 0.7 and p_cls < 0.9:
+        # 4) Hard clamp: if reference is active and VAD is high, zero it
+        if ref_rms > 0.01 and last_vad_prob > 0.3:
             last_vad_prob = 0.0
 
-        # Duck only when VAD is high and mic clearly active
         if last_vad_prob >= VAD_ATTACK and mic_rms >= 0.02 and mic_rms > ref_rms:
             duck_ctrl.notify_speech()
 
@@ -464,8 +465,8 @@ def processing_worker():
 class DuckingApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AEC + VAD + ML Classifier (Linux)")
-        self.root.geometry("580x260")
+        self.root.title("AEC + VAD (Linux)")
+        self.root.geometry("560x250")
         self.running = False
         self.mic_stream = None
         self.ref_stream = None
@@ -482,7 +483,7 @@ class DuckingApp:
             f"MIC={MIC_DEVICE_ID}  REF={REF_DEVICE_ID}  "
             f"I/O={DEVICE_RATE}Hz  VAD={SAMPLE_RATE}Hz  "
             f"Block={FRAME_SIZE} (→ up to {VAD_WINDOW_16K} @16k)  "
-            f"Attack={VAD_ATTACK:.2f} "
+            f"Attack={VAD_ATTACK:.2f} Release={VAD_RELEASE:.2f} "
             f"Gain={GAIN_AFTER_AEC}x  Hold={DUCK_HOLD_SILENCE}s"
         )
         self.status_lbl = ttk.Label(root, text=status)
@@ -583,4 +584,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = DuckingApp(root)
     root.mainloop()
-
