@@ -128,20 +128,21 @@ class SileroVAD:
         if self.model is None:
             return 0.0
         
-        # Ensure correct shape and type
-        if len(audio_frame.shape) == 1:
-            audio_frame = audio_frame.reshape(1, -1)
+        # Ensure 1D array for PyTorch (Silero expects 1D tensor)
+        # ONNX needs 2D (batch, samples)
+        audio_1d = audio_frame.ravel()
         
         try:
             if self.using_torch:
-                # PyTorch inference
+                # PyTorch inference - expects 1D tensor
                 with torch.no_grad():
-                    tensor = torch.from_numpy(audio_frame).float()
+                    tensor = torch.from_numpy(audio_1d).float()
                     prob = self.model(tensor, self.sample_rate).item()
             else:
-                # ONNX inference
+                # ONNX inference - expects 2D (batch, samples)
+                audio_2d = audio_1d.reshape(1, -1)
                 input_name = self.model.get_inputs()[0].name
-                prob = self.model.run(None, {input_name: audio_frame.astype(np.float32)})[0][0]
+                prob = self.model.run(None, {input_name: audio_2d.astype(np.float32)})[0][0]
             
             return float(prob)
             
