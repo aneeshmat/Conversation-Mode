@@ -267,7 +267,7 @@ class AudioCapture:
     def _start_parec_ref(self):
         """Start reference capture using parec subprocess."""
         # Check for manual override first, then auto-detect
-        monitor_source = config.REF_MONITOR_SOURCE or None
+        monitor_source = config.REF_MONITOR_SOURCE if config.REF_MONITOR_SOURCE else None
         if not monitor_source:
             monitor_source = _detect_pipewire_monitor_source()
         
