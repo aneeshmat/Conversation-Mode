@@ -8,7 +8,12 @@ import queue
 import numpy as np
 import sounddevice as sd
 from typing import Optional, Callable, Tuple
-from .. import config
+
+# Handle both package and direct execution
+try:
+    from .. import config
+except ImportError:
+    import config
 
 
 class AudioCapture:

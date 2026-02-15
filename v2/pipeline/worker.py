@@ -7,11 +7,20 @@ import threading
 import time
 import numpy as np
 from typing import Optional
-from ..audio import AudioCapture, VolumeController
-from ..aec import AECProcessor, AECStatus
-from ..vad import SileroVAD
-from ..ducking import DuckController
-from .. import config
+
+# Handle both package and direct execution
+try:
+    from ..audio import AudioCapture, VolumeController
+    from ..aec import AECProcessor, AECStatus
+    from ..vad import SileroVAD
+    from ..ducking import DuckController
+    from .. import config
+except ImportError:
+    from audio import AudioCapture, VolumeController
+    from aec import AECProcessor, AECStatus
+    from vad import SileroVAD
+    from ducking import DuckController
+    import config
 
 
 class ConversationWorker:

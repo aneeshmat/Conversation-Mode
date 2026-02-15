@@ -6,7 +6,12 @@ Includes EMA smoothing and hysteresis for stable speech detection.
 import numpy as np
 import torch
 from typing import Optional
-from .. import config
+
+# Handle both package and direct execution
+try:
+    from .. import config
+except ImportError:
+    import config
 
 
 class SileroVAD:

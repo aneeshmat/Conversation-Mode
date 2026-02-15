@@ -6,9 +6,16 @@ Displays real-time status and controls.
 import tkinter as tk
 from tkinter import ttk
 from typing import Optional
-from ..pipeline import ConversationWorker
-from ..audio import AudioCapture, VolumeController
-from .. import config
+
+# Handle both package and direct execution
+try:
+    from ..pipeline import ConversationWorker
+    from ..audio import AudioCapture, VolumeController
+    from .. import config
+except ImportError:
+    from pipeline import ConversationWorker
+    from audio import AudioCapture, VolumeController
+    import config
 
 
 class ConversationGUI:

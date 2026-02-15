@@ -8,7 +8,12 @@ import os
 import platform
 from typing import Optional
 from enum import Enum
-from .. import config
+
+# Handle both package and direct execution
+try:
+    from .. import config
+except ImportError:
+    import config
 
 
 class AECStatus(Enum):

@@ -6,7 +6,12 @@ Handles volume reduction when speech is detected and restoration when speech end
 import time
 import numpy as np
 from typing import Callable
-from .. import config
+
+# Handle both package and direct execution
+try:
+    from .. import config
+except ImportError:
+    import config
 
 
 class DuckController:
