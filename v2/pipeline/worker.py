@@ -152,6 +152,24 @@ class ConversationWorker:
         # Clip to prevent overflow
         cleaned = np.clip(cleaned, -1.0, 1.0)
         
+        # --- Energy-based gating (suppress VAD on music/lyrics) ---
+        mic_rms = float(np.sqrt(np.mean(cleaned**2) + 1e-9))
+        ref_rms = float(np.sqrt(np.mean(ref_frame**2) + 1e-9)) if ref_frame is not None else 0.0
+        
+        # Gate 1: Absolute floor — if mic is very quiet, never call VAD
+        too_quiet = mic_rms < 0.01
+        
+        # Gate 2: RMS gate — suppress VAD when reference dominates
+        ref_dominates = (ref_rms > 0.0 and mic_rms < 0.5 * ref_rms)
+        
+        # Gate 3: Coherence gate — suppress VAD when cleaned signal is echo-like
+        echo_like = False
+        if ref_frame is not None and len(ref_frame) == len(cleaned):
+            mic_norm = cleaned / (np.linalg.norm(cleaned) + 1e-9)
+            ref_norm = ref_frame / (np.linalg.norm(ref_frame) + 1e-9)
+            coherence = float(np.dot(mic_norm, ref_norm))
+            echo_like = coherence > 0.25
+        
         # Step 4: Resample for VAD (48kHz -> 16kHz)
         vad_audio = self._resample_linear(cleaned, config.DEVICE_RATE, config.SAMPLE_RATE)
         
@@ -167,13 +185,25 @@ class ConversationWorker:
             # Keep remaining samples for next iteration
             self.vad_buffer = self.vad_buffer[self.min_vad_samples:]
             
-            # Run VAD on the chunk
-            speech_active = self.vad.update(vad_chunk)
-            self.last_vad_prob = self.vad.get_probability()
+            # Only run VAD if all gates pass
+            raw_prob = 0.0
+            if not too_quiet and not ref_dominates and not echo_like:
+                speech_active = self.vad.update(vad_chunk)
+                raw_prob = self.vad.get_probability()
+            else:
+                speech_active = False
+            
+            # Gate 4: Hard clamp — if reference is active and VAD still high, zero it
+            if ref_rms > 0.01 and raw_prob > 0.3:
+                raw_prob = 0.0
+                speech_active = False
+            
+            self.last_vad_prob = raw_prob
             self.last_speech_active = speech_active
             
             # Step 6: Update ducking based on VAD result
-            if speech_active:
+            # Only duck if mic is actually louder than reference (near-field speech)
+            if speech_active and mic_rms >= 0.02 and mic_rms > ref_rms:
                 self.duck.notify_speech()
         
         # Always update ducking state (even when VAD not called)
