@@ -29,13 +29,6 @@ class ConversationWorker:
     """
 
     def __init__(self, audio_capture: AudioCapture, volume_controller: VolumeController):
-        """
-        Initialize worker.
-        
-        Args:
-            audio_capture: Audio capture instance
-            volume_controller: Volume controller instance
-        """
         self.audio = audio_capture
         self.volume = volume_controller
 
@@ -62,25 +55,19 @@ class ConversationWorker:
         self.hp_prev_in = 0.0
         self.hp_prev_out = 0.0
 
-        # VAD accumulation buffer (to ensure minimum 512 samples at 16kHz)
+        # VAD accumulation buffer
         self.vad_buffer = np.array([], dtype=np.float32)
-        self.min_vad_samples = 512  # Minimum samples required by Silero VAD
+        self.min_vad_samples = 512  # Silero VAD minimum
 
         # Statistics
         self.frames_processed = 0
         self.last_vad_prob = 0.0
         self.last_speech_active = False
 
+    # -------------------------------------------------------------
+    # High-pass DC-blocking filter
+    # -------------------------------------------------------------
     def _highpass_dc_block(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Apply DC-blocking high-pass filter.
-        
-        Args:
-            audio: Input audio samples
-            
-        Returns:
-            Filtered audio
-        """
         if len(audio) == 0:
             return audio
 
@@ -90,25 +77,17 @@ class ConversationWorker:
         output[0] = audio[0] - self.hp_prev_in + alpha * self.hp_prev_out
 
         for i in range(1, len(audio)):
-            output[i] = audio[i] - audio[i-1] + alpha * output[i-1]
+            output[i] = audio[i] - audio[i - 1] + alpha * output[i - 1]
 
         self.hp_prev_in = audio[-1]
         self.hp_prev_out = output[-1]
 
         return output
 
+    # -------------------------------------------------------------
+    # Linear resampler
+    # -------------------------------------------------------------
     def _resample_linear(self, audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-        """
-        Resample audio using linear interpolation.
-        
-        Args:
-            audio: Input audio
-            src_rate: Source sample rate
-            dst_rate: Destination sample rate
-            
-        Returns:
-            Resampled audio
-        """
         if src_rate == dst_rate:
             return audio
 
@@ -120,111 +99,91 @@ class ConversationWorker:
         if dst_len <= 1:
             return np.zeros(dst_len, dtype=np.float32)
 
-        # Linear interpolation
         src_indices = np.linspace(0, src_len - 1, num=dst_len, dtype=np.float32)
-        left_indices = np.floor(src_indices).astype(np.int64)
-        right_indices = np.minimum(left_indices + 1, src_len - 1)
-        frac = src_indices - left_indices
+        left = np.floor(src_indices).astype(np.int64)
+        right = np.minimum(left + 1, src_len - 1)
+        frac = src_indices - left
 
-        resampled = (1.0 - frac) * audio[left_indices] + frac * audio[right_indices]
+        resampled = (1.0 - frac) * audio[left] + frac * audio[right]
         return resampled.astype(np.float32)
 
+    # -------------------------------------------------------------
+    # Frame processor
+    # -------------------------------------------------------------
     def _process_frame(self, mic_frame: np.ndarray, ref_frame: Optional[np.ndarray]):
-        """
-        Process one audio frame through the pipeline.
-        
-        Args:
-            mic_frame: Microphone audio
-            ref_frame: Reference audio (speaker output), or None
-        """
-        # Step 1: Apply AEC
+        # Step 1: AEC
         if ref_frame is not None and len(ref_frame) == len(mic_frame):
             cleaned = self.aec.process(ref_frame, mic_frame)
         else:
             cleaned = mic_frame.copy()
 
-        # Step 2: High-pass DC-blocking filter
+        # Step 2: High-pass filter
         cleaned = self._highpass_dc_block(cleaned)
 
-        # Step 3: Apply gain boost
+        # Step 3: Gain
         cleaned = cleaned * config.GAIN_AFTER_AEC
-
-        # Clip to prevent overflow
         cleaned = np.clip(cleaned, -1.0, 1.0)
 
-        # --- Energy-based gating (suppress VAD on music/lyrics) ---
+        # Step 4: Energy gating
         mic_rms = float(np.sqrt(np.mean(cleaned**2) + 1e-9))
         ref_rms = float(np.sqrt(np.mean(ref_frame**2) + 1e-9)) if ref_frame is not None else 0.0
-        
-        # Gate 1: Absolute floor — if mic is very quiet, never call VAD
+
         too_quiet = mic_rms < 0.01
-        
-        # Gate 2: RMS gate — suppress VAD when reference dominates
         ref_dominates = (ref_rms > 0.0 and mic_rms < 0.5 * ref_rms)
-        
-        # Gate 3: Coherence gate — suppress VAD when cleaned signal is echo-like
+
         echo_like = False
         if ref_frame is not None and len(ref_frame) == len(cleaned):
             mic_norm = cleaned / (np.linalg.norm(cleaned) + 1e-9)
             ref_norm = ref_frame / (np.linalg.norm(ref_frame) + 1e-9)
             coherence = float(np.dot(mic_norm, ref_norm))
             echo_like = coherence > 0.25
-        
-        # Step 4: Resample for VAD (48kHz -> 16kHz)
+
+        # Step 5: Resample for VAD
         vad_audio = self._resample_linear(cleaned, config.DEVICE_RATE, config.SAMPLE_RATE)
 
-        # Step 5: Accumulate samples in buffer until we have enough for VAD
-        # Silero VAD requires at least 512 samples at 16kHz
+        # Step 6: Accumulate VAD buffer
         self.vad_buffer = np.concatenate([self.vad_buffer, vad_audio])
 
-        # Process VAD only when we have enough samples
         if len(self.vad_buffer) >= self.min_vad_samples:
-            # Take exactly min_vad_samples for VAD processing
             vad_chunk = self.vad_buffer[:self.min_vad_samples]
-
-            # Keep remaining samples for next iteration
             self.vad_buffer = self.vad_buffer[self.min_vad_samples:]
 
-            # Run VAD on the chunk
-            speech_active = self.vad.update(vad_chunk)
-            self.last_vad_prob = self.vad.get_probability()
-            # Only run VAD if all gates pass
-            raw_prob = 0.0
+            # Run VAD only if gates allow
             if not too_quiet and not ref_dominates and not echo_like:
-                speech_active = self.vad.update(vad_chunk)
+                self.vad.update(vad_chunk)
                 raw_prob = self.vad.get_probability()
+                speech_active = raw_prob > 0.5
             else:
+                raw_prob = 0.0
                 speech_active = False
-            
-            # Gate 4: Hard clamp — if reference is active and VAD still high, zero it
+
+            # Hard clamp when reference is active
             if ref_rms > 0.01 and raw_prob > 0.3:
                 raw_prob = 0.0
                 speech_active = False
-            
+
             self.last_vad_prob = raw_prob
             self.last_speech_active = speech_active
 
-            # Step 6: Update ducking based on VAD result
-            if speech_active:
-            # Only duck if mic is actually louder than reference (near-field speech)
+            # Step 7: Ducking
             if speech_active and mic_rms >= 0.02 and mic_rms > ref_rms:
                 self.duck.notify_speech()
 
-        # Always update ducking state (even when VAD not called)
+        # Always update ducking state
         self.duck.update()
 
         self.frames_processed += 1
 
+    # -------------------------------------------------------------
+    # Worker loop
+    # -------------------------------------------------------------
     def _worker_loop(self):
-        """Main worker loop."""
         if config.DEBUG:
             print("[Worker] Starting processing loop")
 
         while not self.stop_event.is_set():
             try:
-                # Get audio frames
                 mic_frame, ref_frame = self.audio.get_frames(timeout=0.1)
-
                 if mic_frame is not None:
                     self._process_frame(mic_frame, ref_frame)
 
@@ -236,32 +195,25 @@ class ConversationWorker:
         if config.DEBUG:
             print("[Worker] Stopped processing loop")
 
+    # -------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------
     def start(self) -> bool:
-        """
-        Start the worker thread.
-        
-        Returns:
-            True if started successfully
-        """
         if self.running:
             return True
 
-        # Start audio capture
         if not self.audio.start():
             return False
 
-        # Reset components
         self.aec.reset()
         self.vad.reset()
         self.duck.reset()
 
-        # Reset filter state and VAD buffer
         self.hp_prev_in = 0.0
         self.hp_prev_out = 0.0
         self.vad_buffer = np.array([], dtype=np.float32)
         self.frames_processed = 0
 
-        # Start worker thread
         self.running = True
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._worker_loop, daemon=True)
@@ -273,63 +225,49 @@ class ConversationWorker:
         return True
 
     def stop(self):
-        """Stop the worker thread."""
         if not self.running:
             return
 
         if config.DEBUG:
             print("[Worker] Stopping...")
 
-        # Signal stop
         self.running = False
         self.stop_event.set()
 
-        # Wait for thread
         if self.thread:
             self.thread.join(timeout=2.0)
             self.thread = None
 
-        # Stop audio
         self.audio.stop()
-
-        # Force restore volume
         self.duck.force_restore()
 
         if config.DEBUG:
             print("[Worker] Stopped")
 
     def is_running(self) -> bool:
-        """Check if worker is running."""
         return self.running
 
     def get_vad_probability(self) -> float:
-        """Get last VAD probability."""
         return self.last_vad_prob
 
     def is_speech_active(self) -> bool:
-        """Check if speech is currently active."""
         return self.last_speech_active
 
     def is_ducked(self) -> bool:
-        """Check if ducking is active."""
         return self.duck.is_ducked()
 
     def get_baseline_volume(self) -> int:
-        """Get baseline volume (-1 if not ducked)."""
         return self.duck.get_baseline()
 
     def get_aec_status(self) -> AECStatus:
-        """Get AEC status."""
         return self.aec.get_status()
 
     def set_aec_enabled(self, enabled: bool):
-        """Enable or disable AEC."""
         self.aec.set_enabled(enabled)
         if not enabled:
             self.aec.reset()
 
     def get_stats(self) -> dict:
-        """Get processing statistics."""
         return {
             'frames_processed': self.frames_processed,
             'vad_probability': self.last_vad_prob,
