@@ -43,7 +43,7 @@ DUCK_BASELINE_CHANGE_THRESHOLD = 3  # Percent difference to detect user volume c
 # ============================================================================
 VAD_ON_THRESHOLD = 0.35       # EMA probability to trigger speech
 VAD_OFF_THRESHOLD = 0.20      # EMA probability to end speech
-VAD_EMA_ALPHA = 0.3           # EMA smoothing factor (0-1, higher = more responsive)
+VAD_EMA_ALPHA = 0.5           # EMA smoothing factor (0-1, higher = more responsive)
 VAD_HOLD_FRAMES = 10          # Hold frames after speech probability drops
 
 # ============================================================================
