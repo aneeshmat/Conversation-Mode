@@ -23,62 +23,35 @@ FRAME_SIZE = 512
 
 import sounddevice as sd
 
-def auto_select_input_device(required_channels=1, required_samplerate=16000):
+def auto_select_input_device():
     devices = sd.query_devices()
-    candidates = []
+    
+    # Strategy 1: Look for the system default first
+    try:
+        default_in = sd.query_devices(kind='input')
+        return default_in['index']
+    except:
+        pass
 
-    for idx, dev in enumerate(devices):
-        if dev["max_input_channels"] >= required_channels:
-            try:
-                sd.check_input_settings(
-                    device=idx,
-                    channels=required_channels,
-                    samplerate=required_samplerate
-                )
-                candidates.append((idx, dev))
-            except Exception:
-                pass
+    # Strategy 2: Search for specific hardware (Surface Pro mic)
+    for i, dev in enumerate(devices):
+        name = dev['name'].lower()
+        if "mic" in name or "input" in name:
+            if dev['max_input_channels'] > 0:
+                return i
+    return None
 
-    if not candidates:
-        return None
-
-    # Prefer non-monitor devices first
-    candidates.sort(key=lambda x: ("monitor" in x[1]["name"].lower()))
-    return candidates[0][0]
+def auto_select_reference_device():
+    devices = sd.query_devices()
+    # On Linux/Pipewire, look for "Monitor" of the output
+    for i, dev in enumerate(devices):
+        name = dev['name'].lower()
+        if "monitor" in name and dev['max_input_channels'] > 0:
+            return i
+    return None
 
 MIC_ID = auto_select_input_device()
 
-def auto_select_reference_device(required_samplerate=48000):
-    devices = sd.query_devices()
-    candidates = []
-
-    keywords = ["monitor", "loopback", "loop", "mix", "echo"]
-
-    for idx, dev in enumerate(devices):
-        name = dev["name"].lower()
-
-        # Must be an input-capable device
-        if dev["max_input_channels"] == 0:
-            continue
-
-        # Must match loopback/monitor keywords
-        if any(k in name for k in keywords):
-            try:
-                sd.check_input_settings(
-                    device=idx,
-                    samplerate=required_samplerate,
-                    channels=1
-                )
-                candidates.append((idx, dev))
-            except Exception:
-                pass
-
-    if not candidates:
-        return None
-
-    # Prefer PulseAudio/PipeWire monitors over ALSA loopbacks
-    candidates.sort(key=lambda x: ("monitor" not in x[1]["name"].lower()))
-    return candidates[0][0]
 REF_ID = auto_select_reference_device()
 
 def get_system_volume():
