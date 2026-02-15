@@ -25,6 +25,8 @@ except ImportError:
 
 # Constants
 FLOAT32_BYTES = 4  # Size of float32 in bytes
+PWRECORD_HEADER_SIZE = 80  # WAV header size for float32 pw-record output (44-byte standard + 36-byte data chunk header)
+PWRECORD_STARTUP_DELAY = 0.4  # Seconds to wait for pw-record to start and write WAV header
 
 
 def _detect_pipewire_monitor_source() -> Optional[str]:
@@ -231,14 +233,13 @@ class AudioCapture:
         if not self.ref_temp_file:
             return
         
-        HEADER_SIZE = 80  # WAV header size for float32 pw-record output
         samples_per_frame = self.frame_size
         bytes_per_frame = samples_per_frame * FLOAT32_BYTES
         
         try:
             with open(self.ref_temp_file, 'rb') as f:
-                # Skip WAV header
-                f.read(HEADER_SIZE)
+                # Skip WAV header (pw-record writes standard WAV header for float32 format)
+                f.read(PWRECORD_HEADER_SIZE)
                 
                 # Chase-read loop
                 while True:
@@ -449,7 +450,7 @@ class AudioCapture:
             )
             
             # Wait for pw-record to start and write header
-            time.sleep(0.4)
+            time.sleep(PWRECORD_STARTUP_DELAY)
             
             # Start chase-read thread
             self.ref_thread = threading.Thread(
