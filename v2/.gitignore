@@ -54,3 +54,6 @@ aec/libaec_speex.dll
 .pytest_cache/
 .coverage
 htmlcov/
+test_parec_capture.py
+test_integration.py
+demo_parec_feature.py

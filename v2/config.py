@@ -16,6 +16,13 @@ FRAME_SIZE = 1024    # Samples per audio frame at device rate
 MIC_DEVICE_ID = int(os.getenv("MIC_DEVICE_ID", "-1"))  # -1 = use default
 REF_DEVICE_ID = int(os.getenv("REF_DEVICE_ID", "-1"))  # -1 = use default
 
+# Reference capture method: 'auto', 'sounddevice', 'parec', 'none'
+# 'auto' - Use sounddevice if REF_DEVICE_ID is set, otherwise try parec for PipeWire/PulseAudio monitor
+# 'sounddevice' - Force sounddevice (requires valid REF_DEVICE_ID)
+# 'parec' - Force parec subprocess for PipeWire/PulseAudio monitor
+# 'none' - Disable reference capture (no AEC)
+REF_CAPTURE_METHOD = os.getenv("REF_CAPTURE_METHOD", "auto")
+
 # ============================================================================
 # Ducking Configuration
 # ============================================================================

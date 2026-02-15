@@ -47,12 +47,23 @@ def main():
     print("Initializing audio capture...")
     audio_capture = AudioCapture(
         mic_device_id=config.MIC_DEVICE_ID,
-        ref_device_id=config.REF_DEVICE_ID
+        ref_device_id=config.REF_DEVICE_ID,
+        ref_capture_method=config.REF_CAPTURE_METHOD
     )
     
     device_info = audio_capture.get_device_info()
     print(f"  Microphone: {device_info['mic_device_name']}")
     print(f"  Reference:  {device_info['ref_device_name']}")
+    
+    # Warn if no reference source is available
+    if device_info['ref_device_name'] == 'Not configured':
+        print()
+        print("WARNING: No reference source available. Speaker output may trigger ducking.")
+        print("  To fix this on Linux with PipeWire/PulseAudio:")
+        print("    1. Set REF_CAPTURE_METHOD=parec to enable monitor source detection")
+        print("    2. Or set REF_DEVICE_ID to a valid device ID for sounddevice")
+        print()
+    
     print(f"  Sample Rate: {device_info['sample_rate']} Hz")
     print(f"  Frame Size:  {device_info['frame_size']} samples")
     print()
