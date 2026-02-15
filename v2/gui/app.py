@@ -252,10 +252,21 @@ def run_gui(worker: ConversationWorker, audio: AudioCapture, volume: VolumeContr
     """
     Run the GUI application.
     
+    This function creates and runs the Tkinter GUI main loop, which blocks
+    until the user closes the window. The worker will be automatically stopped
+    when the window is closed.
+    
     Args:
         worker: Conversation worker instance
         audio: Audio capture instance
         volume: Volume controller instance
+        
+    Returns:
+        None - This function blocks until the GUI is closed
+        
+    Raises:
+        Exception: May raise exceptions related to Tkinter initialization
+                  or GUI rendering
     """
     root = tk.Tk()
     app = ConversationGUI(root, worker, audio, volume)
