@@ -130,4 +130,4 @@ def audio_loop(mic_id, ref_id):
 
             process_audio(mic_frame, ref_frame)
 
-audio_loop(MIC_ID, REF_ID)
+#audio_loop(MIC_ID, REF_ID)
