@@ -292,7 +292,8 @@ class AudioCapture:
                     samplerate=self.sample_rate,
                     blocksize=self.frame_size,
                     callback=self._mic_callback,
-                    dtype=np.float32
+                    dtype=np.float32,
+                    latency="high"
                 )
                 self.mic_stream.start()
                 
@@ -347,7 +348,8 @@ class AudioCapture:
             samplerate=self.sample_rate,
             blocksize=self.frame_size,
             callback=self._ref_callback,
-            dtype=np.float32
+            dtype=np.float32,
+            latency="high"
         )
         self.ref_stream.start()
     
