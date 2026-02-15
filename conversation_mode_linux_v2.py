@@ -43,11 +43,20 @@ def auto_select_input_device():
 
 def auto_select_reference_device():
     devices = sd.query_devices()
-    # On Linux/Pipewire, look for "Monitor" of the output
+    
+    # Priority 1: Specifically look for the PulseAudio/PipeWire "monitor"
     for i, dev in enumerate(devices):
         name = dev['name'].lower()
         if "monitor" in name and dev['max_input_channels'] > 0:
             return i
+            
+    # Priority 2: Look for 'loopback' (common in ALSA setups)
+    for i, dev in enumerate(devices):
+        if "loopback" in dev['name'].lower() and dev['max_input_channels'] > 0:
+            return i
+
+    # Priority 3: Fallback to the system default input if no monitor found 
+    # (Note: This won't work for echo cancellation, but prevents a crash)
     return None
 
 MIC_ID = auto_select_input_device()
