@@ -1,4 +1,6 @@
+from typing import Optional
 import numpy as np
+
 def _process_frame(self, mic_frame: np.ndarray, ref_frame: Optional[np.ndarray]):
         """
         Process one audio frame through the pipeline.
