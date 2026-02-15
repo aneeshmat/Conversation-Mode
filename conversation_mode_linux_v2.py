@@ -24,39 +24,37 @@ FRAME_SIZE = 512
 import sounddevice as sd
 
 def auto_select_input_device():
-    devices = sd.query_devices()
-    
-    # Strategy 1: Look for the system default first
     try:
-        default_in = sd.query_devices(kind='input')
-        return default_in['index']
-    except:
-        pass
-
-    # Strategy 2: Search for specific hardware (Surface Pro mic)
-    for i, dev in enumerate(devices):
-        name = dev['name'].lower()
-        if "mic" in name or "input" in name:
+        # Priority 1: Get the system's actual default input
+        return sd.default.device[0]
+    except Exception:
+        # Priority 2: Manual search for anything labeled as a Mic or Input
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
             if dev['max_input_channels'] > 0:
-                return i
+                name = dev['name'].lower()
+                if any(k in name for k in ["mic", "input", "capture"]):
+                    return i
     return None
 
 def auto_select_reference_device():
     devices = sd.query_devices()
     
-    # Priority 1: Specifically look for the PulseAudio/PipeWire "monitor"
+    # Priority 1: Search for the Server Loopback (Pulse/PipeWire Monitor)
+    # Most Linux distros name this 'monitor' or 'loopback'
     for i, dev in enumerate(devices):
-        name = dev['name'].lower()
-        if "monitor" in name and dev['max_input_channels'] > 0:
-            return i
-            
-    # Priority 2: Look for 'loopback' (common in ALSA setups)
+        if dev['max_input_channels'] > 0:
+            name = dev['name'].lower()
+            if "monitor" in name or "loopback" in name:
+                return i
+                
+    # Priority 2: If no loopback, look for a "Virtual" or "Null" sink
     for i, dev in enumerate(devices):
-        if "loopback" in dev['name'].lower() and dev['max_input_channels'] > 0:
+        if "virtual" in dev['name'].lower() and dev['max_input_channels'] > 0:
             return i
 
-    # Priority 3: Fallback to the system default input if no monitor found 
-    # (Note: This won't work for echo cancellation, but prevents a crash)
+    # Priority 3: Final fallback - if no reference found, return None
+    # Your script should handle REF_ID being None by skipping echo cancellation
     return None
 
 MIC_ID = auto_select_input_device()
