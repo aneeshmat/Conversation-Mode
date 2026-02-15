@@ -6,7 +6,11 @@ import sounddevice as sd
 import subprocess
 import os
 from collections import deque
-import tkinter as tk
+try:
+    import tkinter as tk
+    GUI_AVAILABLE = True
+except Exception:
+    GUI_AVAILABLE = False
 
 # Load Silero VAD model
 model, utils = torch.hub.load(
@@ -31,6 +35,7 @@ REF_DEVICE = os.getenv('REF_DEVICE', None)  # set to your monitor device name or
 FILTER_LEN = 1024  # length of adaptive filter in samples (~64ms for 16kHz)
 NLMS_MU = 0.8
 NLMS_EPS = 1e-6
+USE_GUI = os.getenv('USE_GUI', '1') != '0'
 
 # AEC toggle (GUI controlled)
 aec_enabled = True
@@ -234,6 +239,12 @@ if __name__ == "__main__":
         with aec_lock:
             aec_enabled = bool(value)
 
+    def toggle_aec():
+        with aec_lock:
+            current = aec_enabled
+        set_aec_enabled(not current)
+        print(f"AEC enabled: {not current}")
+
     def run_audio():
         try:
             if REF_DEVICE:
@@ -263,27 +274,35 @@ if __name__ == "__main__":
     audio_thread.start()
 
     try:
-        root = tk.Tk()
-        root.title("Conversation Mode")
-        root.geometry("280x140")
+        has_display = bool(os.getenv('DISPLAY'))
+        if USE_GUI and GUI_AVAILABLE and has_display:
+            print("GUI enabled — toggle AEC in the window.")
+            root = tk.Tk()
+            root.title("Conversation Mode")
+            root.geometry("280x140")
 
-        aec_var = tk.BooleanVar(value=True)
+            aec_var = tk.BooleanVar(value=True)
 
-        title = tk.Label(root, text="AEC / NLMS", font=("Arial", 14))
-        title.pack(pady=10)
+            title = tk.Label(root, text="AEC / NLMS", font=("Arial", 14))
+            title.pack(pady=10)
 
-        toggle = tk.Checkbutton(
-            root,
-            text="Enable Echo Cancellation",
-            variable=aec_var,
-            command=lambda: set_aec_enabled(aec_var.get())
-        )
-        toggle.pack(pady=5)
+            toggle = tk.Checkbutton(
+                root,
+                text="Enable Echo Cancellation",
+                variable=aec_var,
+                command=lambda: set_aec_enabled(aec_var.get())
+            )
+            toggle.pack(pady=5)
 
-        hint = tk.Label(root, text="Uncheck to test base VAD", font=("Arial", 9))
-        hint.pack(pady=5)
+            hint = tk.Label(root, text="Uncheck to test base VAD", font=("Arial", 9))
+            hint.pack(pady=5)
 
-        root.mainloop()
+            root.mainloop()
+        else:
+            print("GUI not available — press Enter to toggle AEC.")
+            while True:
+                input()
+                toggle_aec()
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
