@@ -60,10 +60,11 @@ def auto_select_reference_device():
     for i, dev in enumerate(devices):
         if dev["max_input_channels"] > 0:
             name = dev["name"].lower()
-            if "monitor" in name or "loopback" in name:
+            if "monitor" in name:
                 return i
 
     return None
+
 
 
 MIC_ID = auto_select_input_device()
