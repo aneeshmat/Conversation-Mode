@@ -62,9 +62,9 @@ def test_manual_override():
                 capture.start()
                 
                 # Check that the manual monitor source was used
-                assert capture.parec_monitor_source == 'manually.specified.monitor', \
-                    f"Expected manual override to be used, got: {capture.parec_monitor_source}"
-                print(f"✓ Manual override used: {capture.parec_monitor_source}")
+                assert capture.ref_monitor_source == 'manually.specified.monitor', \
+                    f"Expected manual override to be used, got: {capture.ref_monitor_source}"
+                print(f"✓ Manual override used: {capture.ref_monitor_source}")
                 
                 # Verify that pactl was NOT called (since we used manual override)
                 assert not mock_run.called, "pactl should not be called when manual override is set"
@@ -73,9 +73,11 @@ def test_manual_override():
                 # Verify Popen was called with the correct device
                 mock_popen_call.assert_called_once()
                 call_args = mock_popen_call.call_args[0][0]
-                assert '--device=manually.specified.monitor' in call_args, \
+                # Check for either --device= (parec) or --target= (pw-record)
+                assert ('--device=manually.specified.monitor' in call_args or 
+                        '--target=manually.specified.monitor' in call_args), \
                     f"Expected manual monitor in command, got: {call_args}"
-                print(f"✓ Parec called with correct device: --device={capture.parec_monitor_source}")
+                print(f"✓ Capture called with correct device: {capture.ref_monitor_source}")
                 
                 capture.stop()
 
@@ -93,16 +95,17 @@ def test_empty_override_uses_autodetect():
             ref_capture_method='parec'
         )
         
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "365\tbluez_output.test.monitor\tPipeWire\ts16le 2ch 48000Hz\tRUNNING"
+        # Mock for pactl get-default-sink (returns just the sink name)
+        mock_get_sink_result = MagicMock()
+        mock_get_sink_result.returncode = 0
+        mock_get_sink_result.stdout = "bluez_output.test"
         
         mock_popen = MagicMock()
         mock_popen.poll.return_value = None
         mock_popen.stdout = MagicMock()
         
         with patch('shutil.which', return_value='/usr/bin/parecord'):
-            with patch('subprocess.run', return_value=mock_result) as mock_run:
+            with patch('subprocess.run', return_value=mock_get_sink_result) as mock_run:
                 with patch('subprocess.Popen', return_value=mock_popen):
                     capture.start()
                     
@@ -111,9 +114,9 @@ def test_empty_override_uses_autodetect():
                     print("✓ Auto-detection used when REF_MONITOR_SOURCE is empty")
                     
                     # Verify the auto-detected source was used
-                    assert capture.parec_monitor_source == 'bluez_output.test.monitor', \
-                        f"Expected auto-detected monitor, got: {capture.parec_monitor_source}"
-                    print(f"✓ Auto-detected monitor used: {capture.parec_monitor_source}")
+                    assert capture.ref_monitor_source == 'bluez_output.test.monitor', \
+                        f"Expected auto-detected monitor, got: {capture.ref_monitor_source}"
+                    print(f"✓ Auto-detected monitor used: {capture.ref_monitor_source}")
                     
                     capture.stop()
     finally:
