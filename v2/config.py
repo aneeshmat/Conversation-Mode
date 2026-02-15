@@ -13,8 +13,8 @@ DEVICE_RATE = 48000  # Hardware I/O rate (Hz)
 FRAME_SIZE = 1024    # Samples per audio frame at device rate
 
 # Audio device IDs (from environment variables with sensible defaults)
-MIC_DEVICE_ID = int(os.getenv("MIC_DEVICE_ID", "-1"))  # -1 = use default
-REF_DEVICE_ID = int(os.getenv("REF_DEVICE_ID", "-1"))  # -1 = use default
+MIC_DEVICE_ID = int(os.getenv("MIC_DEVICE_ID", 5))
+REF_DEVICE_ID = int(os.getenv("REF_DEVICE_ID", 12))
 
 # Reference capture method: 'auto', 'sounddevice', 'parec', 'none'
 # 'auto' - Use sounddevice if REF_DEVICE_ID is set, otherwise try parec for PipeWire/PulseAudio monitor
