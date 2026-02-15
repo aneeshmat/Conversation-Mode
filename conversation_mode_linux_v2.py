@@ -37,42 +37,38 @@ def auto_select_input_device():
                     return i
     return None
 
-def get_loopback_device_id():
+def auto_select_reference_device():
+    # 1. Ask PipeWire which sink is active
     try:
-        # 1. Run 'aplay -l' to get the hardware list
-        output = subprocess.check_output(["aplay", "-l"], text=True)
-        
-        # 2. Use regex to find the line: "card 2: Loopback [Loopback], device 0: ..."
-        # This captures the card number (\d+)
-        match = re.search(r"card (\d+): Loopback", output)
-        
-        if match:
-            card_no = match.group(1)
-            search_string = f"hw:{card_no}"
-            
-            # 3. Match the ALSA hardware ID to the sounddevice index
+        out = subprocess.check_output(["wpctl", "status"], text=True)
+        # Find the active sink (marked with "*")
+        m = re.search(r'\*\s+(\d+)\.\s+([^\n]+)', out)
+        if m:
+            sink_name = m.group(2).strip()
+            monitor_name = sink_name + ".monitor"
+
+            # 2. Match this monitor to a sounddevice input
             devices = sd.query_devices()
             for i, dev in enumerate(devices):
-                # We check for the 'hw:X' pattern in the device name/info
-                # and ensure it's an input-capable device
-                if search_string in dev['name'] and dev['max_input_channels'] > 0:
+                if monitor_name.lower() in dev["name"].lower():
                     return i
-                    
-            # Fallback: if 'hw:X' isn't in name, look for 'Loopback' in sounddevice list
-            for i, dev in enumerate(devices):
-                if "loopback" in dev['name'].lower() and dev['max_input_channels'] > 0:
-                    return i
-                    
-        print("Loopback card not found in aplay -l. Is 'snd-aloop' loaded?")
-        return None
-        
-    except Exception as e:
-        print(f"Error identifying loopback: {e}")
-        return None
+    except Exception:
+        pass
+
+    # Fallback: keyword search
+    devices = sd.query_devices()
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] > 0:
+            name = dev["name"].lower()
+            if "monitor" in name or "loopback" in name:
+                return i
+
+    return None
+
 
 MIC_ID = auto_select_input_device()
 
-REF_ID = get_loopback_device_id()
+REF_ID = auto_select_reference_device()
 
 print(MIC_ID) #22
 print(REF_ID) #6
