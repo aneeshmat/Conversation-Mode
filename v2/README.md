@@ -134,6 +134,26 @@ sudo pacman -S speexdsp
    export MIC_DEVICE_ID=5      # Your microphone device ID
    export REF_DEVICE_ID=12     # Your monitor/loopback device ID
    ```
+   
+   **Linux PipeWire/PulseAudio Users:**
+   
+   For systems using PipeWire (e.g., modern Ubuntu, Fedora), the system can automatically detect and use monitor sources via `parec`:
+   
+   ```bash
+   # Auto-detect monitor source (default behavior)
+   python main.py
+   
+   # Force parec method
+   REF_CAPTURE_METHOD=parec python main.py
+   
+   # View available monitor sources
+   pactl list short sources | grep monitor
+   ```
+   
+   This solves issues where sounddevice cannot see PipeWire monitor sources (e.g., Bluetooth speaker monitors). Install PulseAudio utilities if needed:
+   ```bash
+   sudo apt install pulseaudio-utils
+   ```
 
 ## Usage
 
@@ -148,6 +168,16 @@ python main.py
 
 ```bash
 MIC_DEVICE_ID=5 REF_DEVICE_ID=12 python main.py
+```
+
+### With PipeWire Monitor (Recommended for Linux)
+
+```bash
+# Auto-detect and use PipeWire monitor source
+python main.py
+
+# Or force parec method
+REF_CAPTURE_METHOD=parec python main.py
 ```
 
 ### With Debug Logging
@@ -176,6 +206,13 @@ All tunable parameters are in `config.py`:
 - `SAMPLE_RATE = 16000` - VAD processing rate
 - `DEVICE_RATE = 48000` - Hardware I/O rate
 - `FRAME_SIZE = 1024` - Samples per frame
+- `MIC_DEVICE_ID` - Microphone device ID (-1 for default)
+- `REF_DEVICE_ID` - Reference/monitor device ID (-1 for default)
+- `REF_CAPTURE_METHOD` - Reference capture method:
+  - `'auto'` (default) - Use sounddevice if REF_DEVICE_ID is set, otherwise try parec
+  - `'sounddevice'` - Force sounddevice (requires valid REF_DEVICE_ID)
+  - `'parec'` - Force parec for PipeWire/PulseAudio monitor sources
+  - `'none'` - Disable reference capture (no AEC)
 
 ### Ducking Configuration
 - `DUCK_RATIO = 0.5` - Duck to 50% of baseline
@@ -264,6 +301,41 @@ If you see "Failed to start audio capture", you may need to specify device IDs:
    export MIC_DEVICE_ID=<your_mic_id>
    export REF_DEVICE_ID=<your_monitor_id>
    ```
+
+### PipeWire/PulseAudio Reference Capture
+
+**Problem:** Speaker output triggers ducking (false VAD detection)
+
+**Cause:** On Linux with PipeWire, sounddevice's PortAudio backend cannot see monitor sources, causing AEC to be bypassed.
+
+**Solution:** Use parec-based reference capture (automatically enabled by default):
+
+1. Verify PulseAudio utilities are installed:
+   ```bash
+   which pactl parec
+   # If not found: sudo apt install pulseaudio-utils
+   ```
+
+2. Check available monitor sources:
+   ```bash
+   pactl list short sources | grep monitor
+   ```
+   
+   You should see entries like:
+   - `alsa_output.*.monitor` - Built-in audio
+   - `bluez_output.*.monitor` - Bluetooth speakers/headphones
+
+3. Force parec method if auto-detection doesn't work:
+   ```bash
+   REF_CAPTURE_METHOD=parec python main.py
+   ```
+
+4. Expected output on successful detection:
+   ```
+   Reference: PipeWire monitor (bluez_output.*.monitor) via parec
+   ```
+
+**Note:** This is particularly important for Bluetooth speakers/headphones on Surface Pro and similar devices.
 
 ### SpeexDSP Build Issues
 
