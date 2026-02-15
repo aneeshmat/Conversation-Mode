@@ -172,11 +172,12 @@ class ConversationWorker:
             self.last_vad_prob = self.vad.get_probability()
             self.last_speech_active = speech_active
             
-            # Step 6: Update ducking
+            # Step 6: Update ducking based on VAD result
             if speech_active:
                 self.duck.notify_speech()
-            
-            self.duck.update()
+        
+        # Always update ducking state (even when VAD not called)
+        self.duck.update()
         
         self.frames_processed += 1
     
