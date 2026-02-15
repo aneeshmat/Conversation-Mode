@@ -20,6 +20,10 @@ except ImportError:
     import config
 
 
+# Constants
+FLOAT32_BYTES = 4  # Size of float32 in bytes
+
+
 def _detect_pipewire_monitor_source() -> Optional[str]:
     """
     Detect available PipeWire/PulseAudio monitor source.
@@ -151,12 +155,19 @@ class AudioCapture:
         if not self.parec_process:
             return
         
-        bytes_per_sample = 4  # float32
         samples_per_frame = self.frame_size
-        bytes_per_frame = samples_per_frame * bytes_per_sample
+        bytes_per_frame = samples_per_frame * FLOAT32_BYTES
         
         try:
-            while self.running and self.parec_process and self.parec_process.poll() is None:
+            # Check self.running with lock to avoid race conditions
+            while True:
+                with self.lock:
+                    if not self.running:
+                        break
+                
+                if not self.parec_process or self.parec_process.poll() is not None:
+                    break
+                
                 # Read one frame worth of audio data
                 data = self.parec_process.stdout.read(bytes_per_frame)
                 
@@ -173,8 +184,9 @@ class AudioCapture:
                     pass  # Drop frame if queue is full
         
         except Exception as e:
-            if self.on_error and self.running:
-                self.on_error(Exception(f"parec capture error: {e}"))
+            with self.lock:
+                if self.on_error and self.running:
+                    self.on_error(Exception(f"parec capture error: {e}"))
     
     def start(self) -> bool:
         """
@@ -273,11 +285,14 @@ class AudioCapture:
         ]
         
         try:
+            # Use larger buffer to reduce context switches (4 frames worth)
+            buffer_size = self.frame_size * FLOAT32_BYTES * 4
+            
             self.parec_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                bufsize=self.frame_size * 4  # 4 bytes per float32 sample
+                bufsize=buffer_size
             )
             
             # Start capture thread
@@ -299,9 +314,6 @@ class AudioCapture:
         with self.lock:
             if not self.running:
                 return
-            
-            # Signal stop first
-            self.running = False
             
             # Stop microphone stream
             if self.mic_stream:
@@ -335,6 +347,9 @@ class AudioCapture:
                 except Exception:
                     pass
                 self.parec_process = None
+            
+            # Signal stop to threads AFTER closing streams/processes
+            self.running = False
             
             # Wait for parec thread to finish
             if self.parec_thread:
@@ -412,7 +427,6 @@ class AudioCapture:
             info['ref_device_name'] = f'PipeWire monitor ({self.parec_monitor_source}) via parec'
         elif self.ref_device_id is not None:
             try:
-                info['ref_device_name'] = f"sounddevice (device {self.ref_device_id})"
                 device_info = sd.query_devices(self.ref_device_id)
                 info['ref_device_name'] = f"sounddevice ({device_info['name']})"
             except Exception:
