@@ -3,13 +3,7 @@ import sys
 import threading
 import queue
 import ctypes
-import subprocess
-import shutil
 import urllib.request
-import zipfile
-import io
-import re
-import time
 
 import numpy as np
 import sounddevice as sd
@@ -65,7 +59,6 @@ def download_silero_vad_onnx(model_path="silero_vad.onnx"):
 
 
 def download_silero_vad_torch():
-    # Uses torch hub to download Silero VAD
     import torch
     torch.hub.set_dir(os.path.expanduser("~/.cache/torch/hub"))
     print("Downloading Silero VAD Torch model via torch.hub...")
@@ -124,7 +117,7 @@ def init_vad():
 # -----------------------------
 # Universal VAD probability
 # -----------------------------
-def vad_prob_16k(x):
+def vad_prob_16k(x: np.ndarray) -> float:
     """
     Universal ONNX/Torch VAD wrapper.
     Works with:
@@ -138,8 +131,10 @@ def vad_prob_16k(x):
     if vad_model is not None:
         import torch
         with torch.no_grad():
+            # Expect mono 16k, 1D
+            if x.ndim > 1:
+                x = x[:, 0]
             audio_t = torch.from_numpy(x).float()
-            # Silero VAD expects mono 16k
             prob = vad_model(audio_t, 16000).item()
             return float(prob)
 
@@ -147,9 +142,17 @@ def vad_prob_16k(x):
     if vad_session is not None:
         feed = {}
 
+        # Ensure 2D shape: [batch, time]
+        x2 = x.astype("float32")
+        if x2.ndim == 1:
+            x2 = x2[None, :]  # (1, T)
+        elif x2.ndim == 2 and x2.shape[0] != 1:
+            # If it's (T, 1) or multi‑channel, flatten to (1, T)
+            x2 = x2.reshape(1, -1)
+
         for name in onnx_input_names:
             if name == "input":
-                feed[name] = x.astype("float32")
+                feed[name] = x2
             elif name == "state":
                 # Silero state is [2, 1, 128] for standard models
                 feed[name] = np.zeros((2, 1, 128), dtype=np.float32)
@@ -187,7 +190,10 @@ def list_devices():
     default = sd.default.device
     for idx, dev in enumerate(devices):
         mark = "*" if idx == default[0] or idx == default[1] else " "
-        print(f"{mark} {idx:2d} {dev['name']}, {dev['hostapi']} ({dev['max_input_channels']} in, {dev['max_output_channels']} out)")
+        print(
+            f"{mark} {idx:2d} {dev['name']} ({dev['max_input_channels']} in, "
+            f"{dev['max_output_channels']} out)"
+        )
     print("")
 
 
@@ -198,8 +204,8 @@ def audio_callback(indata, outdata, frames, time_info, status):
     # Mono
     mono = indata[:, 0].copy()
 
-    # AEC would go here if you wire it up via aec_lib
-    # For now, just pass through
+    # AEC hook (if you wire it later via aec_lib)
+    # For now, pass-through
     outdata[:, 0] = mono
 
     # Push to queue for VAD / logging
@@ -226,10 +232,7 @@ def audio_loop():
             except queue.Empty:
                 continue
 
-            # VAD on each block
             prob = vad_prob_16k(block)
-            # You can add smoothing / thresholds here
-            # For now, just print occasionally
             if prob > 0.5:
                 print(f"Speech detected, VAD prob={prob:.2f}")
         print("🛑 Audio loop exiting")
