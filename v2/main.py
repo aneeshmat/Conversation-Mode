@@ -61,7 +61,9 @@ def main():
         print("WARNING: No reference source available. Speaker output may trigger ducking.")
         print("  To fix this on Linux with PipeWire/PulseAudio:")
         print("    1. Set REF_CAPTURE_METHOD=parec to enable monitor source detection")
-        print("    2. Or set REF_DEVICE_ID to a valid device ID for sounddevice")
+        print("    2. Set REF_MONITOR_SOURCE=<source_name> to manually specify the monitor")
+        print("       (find source names with: pactl list short sources)")
+        print("    3. Or set REF_DEVICE_ID to a valid device ID for sounddevice")
         print()
     
     print(f"  Sample Rate: {device_info['sample_rate']} Hz")
