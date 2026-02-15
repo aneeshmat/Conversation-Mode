@@ -111,7 +111,7 @@ class AudioDucker:
     def _init_linux_volume(self):
         """Initialize Linux volume control using pactl."""
         self.original_volume = self._get_linux_volume()
-        self.ducked_volume = max(10, int(self.original_volume * (self.duck_percentage / 100.0)))
+        self.ducked_volume = int(self.original_volume * (self.duck_percentage / 100.0))
         
         print(f"Linux volume control initialized.")
         print(f"Original volume: {self.original_volume}%")
@@ -195,6 +195,7 @@ class AudioDucker:
             print(f"Stream status: {status}")
         
         if frames != self.frame_size:
+            print(f"Warning: Expected {self.frame_size} frames but got {frames}")
             return
         
         # Convert audio frame to tensor
