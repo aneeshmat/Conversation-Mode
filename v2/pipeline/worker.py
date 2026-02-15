@@ -129,7 +129,7 @@ class ConversationWorker:
         resampled = (1.0 - frac) * audio[left_indices] + frac * audio[right_indices]
         return resampled.astype(np.float32)
     
-        def _process_frame(self, mic_frame: np.ndarray, ref_frame: Optional[np.ndarray]):
+    def _process_frame(self, mic_frame: np.ndarray, ref_frame: Optional[np.ndarray]):
         """
         Process one audio frame through the pipeline.
         
