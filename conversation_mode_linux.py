@@ -6,6 +6,7 @@ import sounddevice as sd
 import subprocess
 import os
 from collections import deque
+import tkinter as tk
 
 # Load Silero VAD model
 model, utils = torch.hub.load(
@@ -18,11 +19,22 @@ model, utils = torch.hub.load(
 SAMPLE_RATE = 16000
 FRAME_SIZE = 512
 
+# VAD tuning
+VAD_ON_THRESHOLD = float(os.getenv('VAD_ON_THRESHOLD', '0.35'))
+VAD_OFF_THRESHOLD = float(os.getenv('VAD_OFF_THRESHOLD', '0.25'))
+VAD_EMA_ALPHA = float(os.getenv('VAD_EMA_ALPHA', '0.2'))
+VAD_HOLD_FRAMES = int(os.getenv('VAD_HOLD_FRAMES', '6'))  # ~190ms at 512/16k
+DEBUG_EVERY_N = int(os.getenv('DEBUG_EVERY_N', '50'))  # print debug every N frames
+
 # AEC / NLMS config
 REF_DEVICE = os.getenv('REF_DEVICE', None)  # set to your monitor device name or leave None to disable AEC
 FILTER_LEN = 1024  # length of adaptive filter in samples (~64ms for 16kHz)
 NLMS_MU = 0.8
 NLMS_EPS = 1e-6
+
+# AEC toggle (GUI controlled)
+aec_enabled = True
+aec_lock = threading.Lock()
 
 # Reference buffer used by NLMS (stores recent speaker output samples)
 ref_buffer = deque(maxlen=FILTER_LEN * 8)  # keep several frames worth
@@ -60,6 +72,9 @@ class NLMSFilter:
 nlms = NLMSFilter()
 
 prev_state = 'SILENCE'
+vad_prob_ema = None
+vad_hold = 0
+frame_count = 0
 
 # Volume control setup for Linux using PulseAudio/ALSA
 original_volume = None
@@ -119,12 +134,13 @@ def duck_volume():
         duck_timer.start()
 
 def audio_callback(indata, frames, time_info, status):
-    global prev_state
+    global prev_state, vad_prob_ema, vad_hold, frame_count
 
     if frames != FRAME_SIZE:
         return
 
     audio_frame = indata[:, 0].astype(np.float32).copy()
+    frame_count += 1
 
     # Apply acoustic echo cancellation if reference buffer has enough samples
     use_aec = False
@@ -143,7 +159,10 @@ def audio_callback(indata, frames, time_info, status):
                     use_aec = True
                     ref_for_processing = ref_segment
 
-    if use_aec:
+    with aec_lock:
+        aec_on = aec_enabled
+
+    if use_aec and aec_on:
         try:
             processed = nlms.process(ref_for_processing, audio_frame)
             audio_tensor = torch.from_numpy(processed)
@@ -153,8 +172,37 @@ def audio_callback(indata, frames, time_info, status):
     else:
         audio_tensor = torch.from_numpy(audio_frame)
 
-    speech_probs = model(audio_tensor, SAMPLE_RATE).flatten()
-    is_speech = torch.any(speech_probs > 0.5).item()
+    with torch.no_grad():
+        speech_probs = model(audio_tensor, SAMPLE_RATE).flatten()
+        frame_prob = float(torch.mean(speech_probs).item())
+
+    if DEBUG_EVERY_N > 0 and (frame_count % DEBUG_EVERY_N == 0):
+        rms = float(np.sqrt(np.mean(np.square(audio_frame))))
+        print(
+            f"VAD debug — rms={rms:.4f} prob={frame_prob:.3f} ema={vad_prob_ema if vad_prob_ema is not None else frame_prob:.3f}"
+        )
+
+    if vad_prob_ema is None:
+        vad_prob_ema = frame_prob
+    else:
+        vad_prob_ema = (VAD_EMA_ALPHA * frame_prob) + ((1.0 - VAD_EMA_ALPHA) * vad_prob_ema)
+
+    if vad_prob_ema >= VAD_ON_THRESHOLD:
+        is_speech = True
+        vad_hold = VAD_HOLD_FRAMES
+    elif vad_prob_ema < VAD_OFF_THRESHOLD:
+        if vad_hold > 0:
+            vad_hold -= 1
+            is_speech = True
+        else:
+            is_speech = False
+    else:
+        # Between thresholds: keep previous decision, but decay hold
+        if vad_hold > 0:
+            vad_hold -= 1
+            is_speech = True
+        else:
+            is_speech = (prev_state == 'SPEAKING')
 
     if is_speech and prev_state != 'SPEAKING':
         print(f"{time_info.inputBufferAdcTime:.2f}s — SPEAKING detected")
@@ -181,25 +229,62 @@ if __name__ == "__main__":
         with ref_lock:
             ref_buffer.extend(samples.tolist())
 
+    def set_aec_enabled(value):
+        global aec_enabled
+        with aec_lock:
+            aec_enabled = bool(value)
+
+    def run_audio():
+        try:
+            if REF_DEVICE:
+                print(f"Starting reference capture on device: {REF_DEVICE}")
+                ref_stream = sd.InputStream(callback=ref_callback, channels=1,
+                                            samplerate=SAMPLE_RATE, blocksize=FRAME_SIZE,
+                                            device=REF_DEVICE)
+                mic_stream = sd.InputStream(callback=audio_callback, channels=1,
+                                            samplerate=SAMPLE_RATE, blocksize=FRAME_SIZE)
+                with ref_stream, mic_stream:
+                    print("Real-time VAD with AEC and volume ducking started. Speak into the mic.")
+                    while True:
+                        sd.sleep(100)
+            else:
+                print("Reference device not set — running without AEC.")
+                with sd.InputStream(callback=audio_callback, channels=1,
+                                    samplerate=SAMPLE_RATE, blocksize=FRAME_SIZE):
+                    print("Real-time VAD with volume ducking started. Speak into the mic.")
+                    while True:
+                        sd.sleep(100)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            restore_volume()
+
+    audio_thread = threading.Thread(target=run_audio, daemon=True)
+    audio_thread.start()
+
     try:
-        if REF_DEVICE:
-            print(f"Starting reference capture on device: {REF_DEVICE}")
-            ref_stream = sd.InputStream(callback=ref_callback, channels=1,
-                                         samplerate=SAMPLE_RATE, blocksize=FRAME_SIZE,
-                                         device=REF_DEVICE)
-            mic_stream = sd.InputStream(callback=audio_callback, channels=1,
-                                        samplerate=SAMPLE_RATE, blocksize=FRAME_SIZE)
-            with ref_stream, mic_stream:
-                print("Real-time VAD with AEC and volume ducking started. Speak into the mic.")
-                while True:
-                    sd.sleep(100)
-        else:
-            print("Reference device not set — running without AEC.")
-            with sd.InputStream(callback=audio_callback, channels=1,
-                                samplerate=SAMPLE_RATE, blocksize=FRAME_SIZE):
-                print("Real-time VAD with volume ducking started. Speak into the mic.")
-                while True:
-                    sd.sleep(100)
+        root = tk.Tk()
+        root.title("Conversation Mode")
+        root.geometry("280x140")
+
+        aec_var = tk.BooleanVar(value=True)
+
+        title = tk.Label(root, text="AEC / NLMS", font=("Arial", 14))
+        title.pack(pady=10)
+
+        toggle = tk.Checkbutton(
+            root,
+            text="Enable Echo Cancellation",
+            variable=aec_var,
+            command=lambda: set_aec_enabled(aec_var.get())
+        )
+        toggle.pack(pady=5)
+
+        hint = tk.Label(root, text="Uncheck to test base VAD", font=("Arial", 9))
+        hint.pack(pady=5)
+
+        root.mainloop()
     except KeyboardInterrupt:
         print("\nStopped.")
-        restore_volume()  # Ensure volume is restored on exit
+    finally:
+        restore_volume()
