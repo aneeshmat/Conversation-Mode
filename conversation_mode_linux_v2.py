@@ -114,21 +114,25 @@ def process_audio(mic_frame, ref_frame):
     print("Ref RMS:", float(np.sqrt(np.mean(ref_frame**2))))
     # Later: AEC, VAD, subtraction, etc.
 
-
-def audio_loop(mic_id, ref_id):
-    with sd.InputStream(device=mic_id,
-                        channels=1,
+def audio_loop():
+    # device=None → use PipeWire default source (contains mic + monitor)
+    with sd.InputStream(device=None,
+                        channels=2,
                         samplerate=SAMPLE_RATE,
-                        blocksize=FRAME_SIZE) as mic_stream, \
-         sd.InputStream(device=ref_id,
-                        channels=1,
-                        samplerate=SAMPLE_RATE,
-                        blocksize=FRAME_SIZE) as ref_stream:
+                        blocksize=FRAME_SIZE,
+                        dtype='float32') as stream:
 
         while True:
-            mic_frame, _ = mic_stream.read(FRAME_SIZE)
-            ref_frame, _ = ref_stream.read(FRAME_SIZE)
+            frame, _ = stream.read(FRAME_SIZE)
 
-            process_audio(mic_frame, ref_frame)
+            # Split channels
+            mic_frame = frame[:, 0]   # channel 0 = microphone
+            ref_frame = frame[:, 1]   # channel 1 = system audio monitor
 
-audio_loop(MIC_ID, REF_ID)
+            print("Mic RMS:", float(np.sqrt(np.mean(mic_frame**2))))
+            print("Ref RMS:", float(np.sqrt(np.mean(ref_frame**2))))
+
+audio_loop()
+
+
+audio_loop()
