@@ -37,25 +37,38 @@ def auto_select_input_device():
                     return i
     return None
 
-def auto_select_reference_device():
-    devices = sd.query_devices()
-    
-    # Priority 1: Search for the Server Loopback (Pulse/PipeWire Monitor)
-    # Most Linux distros name this 'monitor' or 'loopback'
-    for i, dev in enumerate(devices):
-        if dev['max_input_channels'] > 0:
-            name = dev['name'].lower()
-            if "monitor" in name or "loopback" in name:
-                return i
-                
-    # Priority 2: If no loopback, look for a "Virtual" or "Null" sink
-    for i, dev in enumerate(devices):
-        if "virtual" in dev['name'].lower() and dev['max_input_channels'] > 0:
-            return i
-
-    # Priority 3: Final fallback - if no reference found, return None
-    # Your script should handle REF_ID being None by skipping echo cancellation
-    return None
+def get_loopback_device_id():
+    try:
+        # 1. Run 'aplay -l' to get the hardware list
+        output = subprocess.check_output(["aplay", "-l"], text=True)
+        
+        # 2. Use regex to find the line: "card 2: Loopback [Loopback], device 0: ..."
+        # This captures the card number (\d+)
+        match = re.search(r"card (\d+): Loopback", output)
+        
+        if match:
+            card_no = match.group(1)
+            search_string = f"hw:{card_no}"
+            
+            # 3. Match the ALSA hardware ID to the sounddevice index
+            devices = sd.query_devices()
+            for i, dev in enumerate(devices):
+                # We check for the 'hw:X' pattern in the device name/info
+                # and ensure it's an input-capable device
+                if search_string in dev['name'] and dev['max_input_channels'] > 0:
+                    return i
+                    
+            # Fallback: if 'hw:X' isn't in name, look for 'Loopback' in sounddevice list
+            for i, dev in enumerate(devices):
+                if "loopback" in dev['name'].lower() and dev['max_input_channels'] > 0:
+                    return i
+                    
+        print("Loopback card not found in aplay -l. Is 'snd-aloop' loaded?")
+        return None
+        
+    except Exception as e:
+        print(f"Error identifying loopback: {e}")
+        return None
 
 MIC_ID = auto_select_input_device()
 
