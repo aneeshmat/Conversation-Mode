@@ -7,7 +7,7 @@ import subprocess
 import re
 import os
 
-from collections import dequeue
+from collections import deque
 
 try:
   import tkinter as tk
