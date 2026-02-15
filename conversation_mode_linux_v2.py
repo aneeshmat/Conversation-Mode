@@ -110,26 +110,28 @@ def get_system_volume():
 
     return None
 
-def audio_loop(mic_id, ref_id, samplerate=16000, framesize=512):
+def process_audio(mic_frame, ref_frame):
+    # mic_frame: numpy array (FRAME_SIZE, 1)
+    # ref_frame: numpy array (FRAME_SIZE, 1)
+    print("Mic RMS:", float(np.sqrt(np.mean(mic_frame**2))))
+    print("Ref RMS:", float(np.sqrt(np.mean(ref_frame**2))))
+    # Later: AEC, VAD, subtraction, etc.
+
+
+def audio_loop(mic_id, ref_id):
     with sd.InputStream(device=mic_id,
                         channels=1,
-                        samplerate=samplerate,
-                        blocksize=framesize) as mic_stream, \
+                        samplerate=SAMPLE_RATE,
+                        blocksize=FRAME_SIZE) as mic_stream, \
          sd.InputStream(device=ref_id,
                         channels=1,
-                        samplerate=samplerate,
-                        blocksize=framesize) as ref_stream:
+                        samplerate=SAMPLE_RATE,
+                        blocksize=FRAME_SIZE) as ref_stream:
 
         while True:
-            mic_frame, _ = mic_stream.read(framesize)
-            ref_frame, _ = ref_stream.read(framesize)
+            mic_frame, _ = mic_stream.read(FRAME_SIZE)
+            ref_frame, _ = ref_stream.read(FRAME_SIZE)
 
             process_audio(mic_frame, ref_frame)
 
-def process_audio(mic_frame, ref_frame):
-    """
-    mic_frame: numpy array of shape (N, 1) from microphone
-    ref_frame: numpy array of shape (N, 1) from loopback/monitor device
-    """
-    # For now, just a placeholder
-    pass
+audio_loop(MIC_ID, REF_ID)
