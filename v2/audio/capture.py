@@ -1,7 +1,7 @@
 """
 Audio capture module for microphone and reference (speaker monitor) streams.
 Uses sounddevice for cross-platform audio I/O.
-Supports PipeWire/PulseAudio monitor sources via parec for Linux systems.
+Supports PipeWire/PulseAudio monitor sources via pw-record and parec for Linux systems.
 """
 
 import threading
@@ -11,6 +11,9 @@ import sounddevice as sd
 import subprocess
 import struct
 import shutil
+import tempfile
+import os
+import time
 from typing import Optional, Callable, Tuple
 
 # Handle both package and direct execution
@@ -22,6 +25,9 @@ except ImportError:
 
 # Constants
 FLOAT32_BYTES = 4  # Size of float32 in bytes
+PWRECORD_HEADER_SIZE = 80  # WAV header size for pw-record float32 output (empirically determined, includes standard WAV header and format-specific chunks)
+PWRECORD_STARTUP_DELAY = 0.4  # Seconds to wait for pw-record to start and write WAV header
+PWRECORD_CHASE_RETRY_DELAY = 0.005  # Seconds to wait when insufficient data available during chase-read (5ms)
 
 
 def _detect_pipewire_monitor_source() -> Optional[str]:
@@ -86,6 +92,33 @@ def _detect_pipewire_monitor_source() -> Optional[str]:
         return None
 
 
+def _get_default_monitor_source() -> Optional[str]:
+    """
+    Get the monitor source for the default sink.
+    This is a simpler and more reliable detection method.
+    
+    Returns:
+        Monitor source name (e.g., 'bluez_output.*.monitor') or None if not found
+    """
+    try:
+        if not shutil.which('pactl'):
+            return None
+        
+        result = subprocess.run(
+            ['pactl', 'get-default-sink'],
+            capture_output=True,
+            text=True,
+            timeout=2.0
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip() + '.monitor'
+        
+        return None
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+        return None
+
+
 class AudioCapture:
     """
     Manages audio capture from microphone and reference (speaker monitor) streams.
@@ -119,10 +152,11 @@ class AudioCapture:
         self.mic_stream: Optional[sd.InputStream] = None
         self.ref_stream: Optional[sd.InputStream] = None
         
-        # parec subprocess and thread
-        self.parec_process: Optional[subprocess.Popen] = None
-        self.parec_thread: Optional[threading.Thread] = None
-        self.parec_monitor_source: Optional[str] = None
+        # Reference capture subprocess and thread (for parec or pw-record)
+        self.ref_process: Optional[subprocess.Popen] = None
+        self.ref_thread: Optional[threading.Thread] = None
+        self.ref_monitor_source: Optional[str] = None
+        self.ref_temp_file: Optional[str] = None
         
         # State
         self.running = False
@@ -159,7 +193,7 @@ class AudioCapture:
     
     def _parec_capture_loop(self):
         """Thread loop for capturing audio from parec subprocess."""
-        if not self.parec_process:
+        if not self.ref_process:
             return
         
         samples_per_frame = self.frame_size
@@ -172,11 +206,11 @@ class AudioCapture:
                     if not self.running:
                         break
                 
-                if not self.parec_process or self.parec_process.poll() is not None:
+                if not self.ref_process or self.ref_process.poll() is not None:
                     break
                 
                 # Read one frame worth of audio data
-                data = self.parec_process.stdout.read(bytes_per_frame)
+                data = self.ref_process.stdout.read(bytes_per_frame)
                 
                 if not data or len(data) < bytes_per_frame:
                     break
@@ -194,6 +228,50 @@ class AudioCapture:
             with self.lock:
                 if self.on_error and self.running:
                     self.on_error(Exception(f"parec capture error: {e}"))
+    
+    def _pwrecord_chase_loop(self):
+        """Thread loop for chase-reading audio from pw-record WAV file."""
+        if not self.ref_temp_file:
+            return
+        
+        samples_per_frame = self.frame_size
+        bytes_per_frame = samples_per_frame * FLOAT32_BYTES
+        
+        try:
+            with open(self.ref_temp_file, 'rb') as f:
+                # Skip WAV header
+                # pw-record writes a consistent WAV header format for float32 output
+                # If the format changes in future pw-record versions, this may need adjustment
+                f.read(PWRECORD_HEADER_SIZE)
+                
+                # Chase-read loop
+                while True:
+                    with self.lock:
+                        if not self.running:
+                            break
+                    
+                    # Read one frame worth of audio data
+                    data = f.read(bytes_per_frame)
+                    
+                    if len(data) < bytes_per_frame:
+                        # Not enough data yet, wait briefly for pw-record to write more
+                        time.sleep(PWRECORD_CHASE_RETRY_DELAY)
+                        continue
+                    
+                    # Convert bytes to float32 array
+                    audio = np.frombuffer(data, dtype=np.float32)
+                    
+                    # Put in queue (non-blocking)
+                    try:
+                        self.ref_queue.put_nowait(audio)
+                    except queue.Full:
+                        pass  # Drop frame if queue is full
+        
+        except Exception as e:
+            with self.lock:
+                if self.on_error and self.running:
+                    self.on_error(Exception(f"pw-record capture error: {e}"))
+
     
     def start(self) -> bool:
         """
@@ -219,7 +297,7 @@ class AudioCapture:
                 self.mic_stream.start()
                 
                 # Determine reference capture method
-                use_parec = False
+                use_ref_capture = False
                 
                 if self.ref_capture_method == 'none':
                     # Explicitly disabled
@@ -230,18 +308,27 @@ class AudioCapture:
                         self._start_sounddevice_ref()
                 elif self.ref_capture_method == 'parec':
                     # Force parec method
-                    use_parec = True
+                    use_ref_capture = 'parec'
                 else:  # 'auto'
-                    # Auto-detect: prefer sounddevice if available, fallback to parec
+                    # Auto-detect: prefer sounddevice if available, fallback to pw-record/parec
                     if self.ref_device_id is not None:
                         self._start_sounddevice_ref()
                     else:
-                        # Try parec for PipeWire/PulseAudio monitor
-                        use_parec = True
+                        # Try pw-record/parec for PipeWire/PulseAudio monitor
+                        use_ref_capture = 'auto'
                 
-                # Start parec if needed
-                if use_parec:
-                    self._start_parec_ref()
+                # Start reference capture if needed
+                if use_ref_capture:
+                    if use_ref_capture == 'parec':
+                        # Force parec only
+                        self._start_parec_ref()
+                    else:  # 'auto'
+                        # Try pw-record first, fall back to parec
+                        self._start_pwrecord_ref()
+                        # If pw-record didn't start, try parec
+                        if not self.ref_process:
+                            self._start_parec_ref()
+
                 
                 self.running = True
                 return True
@@ -269,7 +356,10 @@ class AudioCapture:
         # Check for manual override first, then auto-detect
         monitor_source = config.REF_MONITOR_SOURCE if config.REF_MONITOR_SOURCE else None
         if not monitor_source:
-            monitor_source = _detect_pipewire_monitor_source()
+            # Try simple method first, then fall back to parser
+            monitor_source = _get_default_monitor_source()
+            if not monitor_source:
+                monitor_source = _detect_pipewire_monitor_source()
         
         if not monitor_source:
             # No monitor source available
@@ -280,7 +370,7 @@ class AudioCapture:
         if not parec_cmd:
             return
         
-        self.parec_monitor_source = monitor_source
+        self.ref_monitor_source = monitor_source
         
         # Start parec subprocess
         # Output: float32le, mono, 48000Hz, raw PCM
@@ -297,7 +387,7 @@ class AudioCapture:
             # Use larger buffer to reduce context switches (4 frames worth)
             buffer_size = self.frame_size * FLOAT32_BYTES * 4
             
-            self.parec_process = subprocess.Popen(
+            self.ref_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -305,18 +395,93 @@ class AudioCapture:
             )
             
             # Start capture thread
-            self.parec_thread = threading.Thread(
+            self.ref_thread = threading.Thread(
                 target=self._parec_capture_loop,
                 daemon=True
             )
-            self.parec_thread.start()
+            self.ref_thread.start()
         
         except Exception as e:
             if self.on_error:
                 self.on_error(Exception(f"Failed to start parec: {e}"))
-            self.parec_process = None
-            self.parec_thread = None
-            self.parec_monitor_source = None
+            self.ref_process = None
+            self.ref_thread = None
+            self.ref_monitor_source = None
+    
+    def _start_pwrecord_ref(self):
+        """Start reference capture using pw-record subprocess with chase-read."""
+        # Check if pw-record is available
+        if not shutil.which('pw-record'):
+            return
+        
+        # Determine monitor target
+        # Priority: manual override > default sink monitor > parser detection
+        monitor_target = config.REF_MONITOR_SOURCE if config.REF_MONITOR_SOURCE else None
+        if not monitor_target:
+            # Try simple method first
+            monitor_target = _get_default_monitor_source()
+            if not monitor_target:
+                # Fall back to parser
+                monitor_target = _detect_pipewire_monitor_source()
+        
+        if not monitor_target:
+            # No monitor source available
+            return
+        
+        self.ref_monitor_source = monitor_target
+        
+        try:
+            # Create temporary WAV file
+            fd, temp_file = tempfile.mkstemp(suffix='.wav', prefix='pw_chase_')
+            os.close(fd)  # Close the file descriptor, we'll open it later
+            self.ref_temp_file = temp_file
+            
+            # Start pw-record subprocess
+            # Output: float32, mono, sample_rate Hz, WAV file
+            cmd = [
+                'pw-record',
+                f'--target={monitor_target}',
+                '--format=f32',
+                '--channels=1',
+                f'--rate={self.sample_rate}',
+                temp_file
+            ]
+            
+            self.ref_process = subprocess.Popen(
+                cmd,
+                stderr=subprocess.DEVNULL
+            )
+            
+            # Wait for pw-record to start and write header
+            time.sleep(PWRECORD_STARTUP_DELAY)
+            
+            # Start chase-read thread
+            self.ref_thread = threading.Thread(
+                target=self._pwrecord_chase_loop,
+                daemon=True
+            )
+            self.ref_thread.start()
+        
+        except Exception as e:
+            if self.on_error:
+                self.on_error(Exception(f"Failed to start pw-record: {e}"))
+            # Clean up on error
+            if self.ref_process:
+                try:
+                    self.ref_process.terminate()
+                    self.ref_process.wait(timeout=1.0)
+                except Exception:
+                    pass
+            if self.ref_temp_file and os.path.exists(self.ref_temp_file):
+                try:
+                    os.unlink(self.ref_temp_file)
+                except Exception:
+                    pass
+            self.ref_process = None
+            self.ref_thread = None
+            self.ref_monitor_source = None
+            self.ref_temp_file = None
+
     
     def stop(self):
         """Stop audio capture streams."""
@@ -342,33 +507,43 @@ class AudioCapture:
                     pass
                 self.ref_stream = None
             
-            # Stop parec subprocess
-            if self.parec_process:
+            # Stop reference capture subprocess (parec or pw-record)
+            if self.ref_process:
                 try:
-                    self.parec_process.terminate()
+                    self.ref_process.terminate()
                     # Give it a moment to terminate gracefully
                     try:
-                        self.parec_process.wait(timeout=1.0)
+                        self.ref_process.wait(timeout=1.0)
                     except subprocess.TimeoutExpired:
                         # Force kill if not terminated
-                        self.parec_process.kill()
-                        self.parec_process.wait()
+                        self.ref_process.kill()
+                        self.ref_process.wait()
                 except Exception:
                     pass
-                self.parec_process = None
+                self.ref_process = None
             
             # Signal stop to threads AFTER closing streams/processes
             self.running = False
             
-            # Wait for parec thread to finish
-            if self.parec_thread:
+            # Wait for reference capture thread to finish
+            if self.ref_thread:
                 try:
-                    self.parec_thread.join(timeout=2.0)
+                    self.ref_thread.join(timeout=2.0)
                 except Exception:
                     pass
-                self.parec_thread = None
+                self.ref_thread = None
             
-            self.parec_monitor_source = None
+            # Clean up temp file if it exists
+            if self.ref_temp_file:
+                try:
+                    if os.path.exists(self.ref_temp_file):
+                        os.unlink(self.ref_temp_file)
+                except Exception:
+                    pass
+                self.ref_temp_file = None
+            
+            self.ref_monitor_source = None
+
             
             # Clear queues
             while not self.mic_queue.empty():
@@ -432,8 +607,10 @@ class AudioCapture:
             info['mic_device_name'] = 'Unknown'
         
         # Determine reference device/source name
-        if self.parec_monitor_source:
-            info['ref_device_name'] = f'PipeWire monitor ({self.parec_monitor_source}) via parec'
+        if self.ref_monitor_source:
+            # Determine method based on temp file existence
+            method = 'pw-record' if self.ref_temp_file else 'parec'
+            info['ref_device_name'] = f'PipeWire monitor ({self.ref_monitor_source}) via {method}'
         elif self.ref_device_id is not None:
             try:
                 device_info = sd.query_devices(self.ref_device_id)
