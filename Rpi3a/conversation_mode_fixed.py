@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 import threading
@@ -18,10 +19,7 @@ running = False
 audio_thread = None
 audio_q = queue.Queue()
 
-vad_model = None          # Torch model
-vad_session = None        # ONNX session
-onnx_input_names = []     # ONNX input names
-
+vad_model = None          # Torch Silero VAD model
 aec_lib = None
 
 # -----------------------------
@@ -45,19 +43,8 @@ def load_aec_shared_object():
 
 
 # -----------------------------
-# Silero VAD download helpers
+# Silero VAD (Torch) helpers
 # -----------------------------
-def download_silero_vad_onnx(model_path="silero_vad.onnx"):
-    if os.path.isfile(model_path):
-        return model_path
-
-    print("Downloading Silero VAD ONNX model...")
-    url = "https://github.com/snakers4/silero-vad/raw/master/files/silero_vad.onnx"
-    urllib.request.urlretrieve(url, model_path)
-    print("✅ Silero VAD ONNX downloaded")
-    return model_path
-
-
 def download_silero_vad_torch():
     import torch
     torch.hub.set_dir(os.path.expanduser("~/.cache/torch/hub"))
@@ -71,99 +58,50 @@ def download_silero_vad_torch():
     return model, utils
 
 
-# -----------------------------
-# VAD initialization
-# -----------------------------
 def init_vad():
-    global vad_model, vad_session, onnx_input_names
-
-    # Try Torch first
+    global vad_model
     try:
-        import torch
-        try:
-            import torchaudio  # Silero often expects this
-        except ImportError:
-            print("⚠️ torchaudio not found, Torch VAD may fail for resampling")
-
-        try:
-            vad_model, utils = download_silero_vad_torch()
-            vad_model.eval()
-            print("✅ Silero VAD (Torch) initialized")
-            return
-        except Exception as e:
-            print(f"⚠️ Torch/Silero VAD load failed: {e}")
-            vad_model = None
-    except ImportError:
-        print("⚠️ torch not installed, skipping Torch VAD")
-
-    # Fallback to ONNX
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        print("❌ ONNX fallback failed: onnxruntime not installed")
-        vad_session = None
+        import torch  # noqa: F401
+        import torchaudio  # noqa: F401
+        import packaging  # noqa: F401
+    except ImportError as e:
+        print(f"❌ Torch VAD dependencies missing: {e}")
+        print("   Install with: pip install torch torchaudio packaging")
+        vad_model = None
         return
 
     try:
-        model_path = download_silero_vad_onnx()
-        vad_session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-        onnx_input_names = [i.name for i in vad_session.get_inputs()]
-        print("✅ Silero VAD (ONNX) loaded")
+        vad_model, utils = download_silero_vad_torch()
+        vad_model.eval()
+        print("✅ Silero VAD (Torch) initialized")
     except Exception as e:
-        print(f"❌ ONNX fallback failed: {e}")
-        vad_session = None
+        print(f"❌ Torch/Silero VAD load failed: {e}")
+        vad_model = None
 
 
 # -----------------------------
-# Universal VAD probability
+# VAD probability (Torch only)
 # -----------------------------
 def vad_prob_16k(x: np.ndarray) -> float:
     """
-    Universal ONNX/Torch VAD wrapper.
-    Works with:
-      - Torch Silero VAD
-      - ONNX 2-input model (input, state)
-      - ONNX 3-input model (input, state, sr)
+    Torch Silero VAD wrapper.
+    Expects mono 16k audio.
     """
-    global vad_model, vad_session, onnx_input_names
+    global vad_model
 
-    # Torch path
-    if vad_model is not None:
-        import torch
-        with torch.no_grad():
-            # Expect mono 16k, 1D
-            if x.ndim > 1:
-                x = x[:, 0]
-            audio_t = torch.from_numpy(x).float()
-            prob = vad_model(audio_t, 16000).item()
-            return float(prob)
+    if vad_model is None:
+        return 0.0
 
-    # ONNX path
-    if vad_session is not None:
-        feed = {}
+    import torch
 
-        # Ensure 2D shape: [batch, time]
-        x2 = x.astype("float32")
-        if x2.ndim == 1:
-            x2 = x2[None, :]  # (1, T)
-        elif x2.ndim == 2 and x2.shape[0] != 1:
-            # If it's (T, 1) or multi‑channel, flatten to (1, T)
-            x2 = x2.reshape(1, -1)
+    # Ensure mono 1D
+    if x.ndim > 1:
+        x = x[:, 0]
+    audio_t = torch.from_numpy(x).float()
 
-        for name in onnx_input_names:
-            if name == "input":
-                feed[name] = x2
-            elif name == "state":
-                # Silero state is [2, 1, 128] for standard models
-                feed[name] = np.zeros((2, 1, 128), dtype=np.float32)
-            elif name == "sr":
-                feed[name] = np.array([16000], dtype=np.int64)
-
-        out = vad_session.run(None, feed)[0]
-        return float(out.squeeze())
-
-    # No VAD available
-    return 0.0
+    with torch.no_grad():
+        prob = vad_model(audio_t, 16000).item()
+    return float(prob)
 
 
 def warmup_vad():
@@ -191,8 +129,8 @@ def list_devices():
     for idx, dev in enumerate(devices):
         mark = "*" if idx == default[0] or idx == default[1] else " "
         print(
-            f"{mark} {idx:2d} {dev['name']} ({dev['max_input_channels']} in, "
-            f"{dev['max_output_channels']} out)"
+            f"{mark} {idx:2d} {dev['name']} "
+            f"({dev['max_input_channels']} in, {dev['max_output_channels']} out)"
         )
     print("")
 
@@ -271,7 +209,7 @@ if __name__ == "__main__":
 
     # Tkinter GUI
     root = tk.Tk()
-    root.title("Conversation Mode with AEC + VAD")
+    root.title("Conversation Mode with AEC + Torch VAD")
 
     mainframe = ttk.Frame(root, padding="10")
     mainframe.grid(row=0, column=0, sticky="nsew")
@@ -279,7 +217,7 @@ if __name__ == "__main__":
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
 
-    lbl = ttk.Label(mainframe, text="Conversation Mode (AEC + VAD)")
+    lbl = ttk.Label(mainframe, text="Conversation Mode (AEC + Torch VAD)")
     lbl.grid(row=0, column=0, pady=(0, 10))
 
     btn_toggle = ttk.Button(mainframe, text="Start", command=toggle)
