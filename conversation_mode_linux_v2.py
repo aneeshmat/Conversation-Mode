@@ -54,6 +54,9 @@ MIC_ID = auto_select_input_device()
 
 REF_ID = auto_select_reference_device()
 
+print(MIC_ID)
+print(REF_ID)
+
 def get_system_volume():
     # 1. Try PipeWire (wpctl)
     try:
