@@ -8,7 +8,7 @@ Conversation Mode v2 is a complete rewrite of the original Conversation Mode sof
 
 ### Use Case
 
-> "I am sitting at my desk with my girlfriend and we are blasting music from a speaker. When either of us is talking, the system volume decreases such that we can hear each other. When we are done talking, the system volume is restored."
+> Blasting music in the car while still being able to chat
 
 ## Key Features
 
