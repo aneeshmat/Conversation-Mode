@@ -56,14 +56,21 @@ def _detect_pipewire_monitor_source() -> Optional[str]:
             if not line:
                 continue
             
-            parts = line.split()
-            if len(parts) < 5:
+            # Split on tabs first (pactl uses tab-delimited output)
+            parts = line.split('\t')
+            
+            # Fallback to whitespace split if tab split gives too few parts
+            if len(parts) < 3:
+                parts = line.split()
+            
+            if len(parts) < 2:
                 continue
             
-            source_name = parts[1]
-            state = parts[4]
+            source_name = parts[1].strip()
+            # State is always the last field
+            state = parts[-1].strip()
             
-            # Look for .monitor sources
+            # Check for .monitor in source name
             if '.monitor' in source_name:
                 if state == 'RUNNING':
                     # Prefer a running monitor source
@@ -259,8 +266,10 @@ class AudioCapture:
     
     def _start_parec_ref(self):
         """Start reference capture using parec subprocess."""
-        # Detect monitor source
-        monitor_source = _detect_pipewire_monitor_source()
+        # Check for manual override first, then auto-detect
+        monitor_source = getattr(config, 'REF_MONITOR_SOURCE', '') or None
+        if not monitor_source:
+            monitor_source = _detect_pipewire_monitor_source()
         
         if not monitor_source:
             # No monitor source available

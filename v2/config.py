@@ -23,6 +23,11 @@ REF_DEVICE_ID = int(os.getenv("REF_DEVICE_ID", "-1"))  # -1 = use default
 # 'none' - Disable reference capture (no AEC)
 REF_CAPTURE_METHOD = os.getenv("REF_CAPTURE_METHOD", "auto")
 
+# Manual override for PipeWire/PulseAudio monitor source name
+# Set this if auto-detection fails (e.g., "bluez_output.20_64_DE_A6_AA_69.1.monitor")
+# Find source names with: pactl list short sources
+REF_MONITOR_SOURCE = os.getenv("REF_MONITOR_SOURCE", "")
+
 # ============================================================================
 # Ducking Configuration
 # ============================================================================
