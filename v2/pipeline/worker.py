@@ -62,6 +62,10 @@ class ConversationWorker:
         self.hp_prev_in = 0.0
         self.hp_prev_out = 0.0
         
+        # VAD accumulation buffer (to ensure minimum 512 samples at 16kHz)
+        self.vad_buffer = np.array([], dtype=np.float32)
+        self.min_vad_samples = 512  # Minimum samples required by Silero VAD
+        
         # Statistics
         self.frames_processed = 0
         self.last_vad_prob = 0.0
@@ -151,15 +155,28 @@ class ConversationWorker:
         # Step 4: Resample for VAD (48kHz -> 16kHz)
         vad_audio = self._resample_linear(cleaned, config.DEVICE_RATE, config.SAMPLE_RATE)
         
-        # Step 5: Run VAD
-        speech_active = self.vad.update(vad_audio)
-        self.last_vad_prob = self.vad.get_probability()
-        self.last_speech_active = speech_active
+        # Step 5: Accumulate samples in buffer until we have enough for VAD
+        # Silero VAD requires at least 512 samples at 16kHz
+        self.vad_buffer = np.concatenate([self.vad_buffer, vad_audio])
         
-        # Step 6: Update ducking
-        if speech_active:
-            self.duck.notify_speech()
+        # Process VAD only when we have enough samples
+        if len(self.vad_buffer) >= self.min_vad_samples:
+            # Take exactly min_vad_samples for VAD processing
+            vad_chunk = self.vad_buffer[:self.min_vad_samples]
+            
+            # Keep remaining samples for next iteration
+            self.vad_buffer = self.vad_buffer[self.min_vad_samples:]
+            
+            # Run VAD on the chunk
+            speech_active = self.vad.update(vad_chunk)
+            self.last_vad_prob = self.vad.get_probability()
+            self.last_speech_active = speech_active
+            
+            # Step 6: Update ducking based on VAD result
+            if speech_active:
+                self.duck.notify_speech()
         
+        # Always update ducking state (even when VAD not called)
         self.duck.update()
         
         self.frames_processed += 1
@@ -204,9 +221,10 @@ class ConversationWorker:
         self.vad.reset()
         self.duck.reset()
         
-        # Reset filter state
+        # Reset filter state and VAD buffer
         self.hp_prev_in = 0.0
         self.hp_prev_out = 0.0
+        self.vad_buffer = np.array([], dtype=np.float32)
         self.frames_processed = 0
         
         # Start worker thread
