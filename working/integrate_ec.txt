@@ -1,0 +1,78 @@
+## aneesh@aneesh-Surface-Pro-8:~$ cd Documents/Conversation-Mode/
+## aneesh@aneesh-Surface-Pro-8:~/Documents/Conversation-Mode$ git clone https://github.com/voice-engine/ec.git
+Cloning into 'ec'...
+remote: Enumerating objects: 208, done.
+remote: Total 208 (delta 0), reused 0 (delta 0), pack-reused 208 (from 1)
+Receiving objects: 100% (208/208), 82.40 KiB | 1.87 MiB/s, done.
+Resolving deltas: 100% (104/104), done.
+## aneesh@aneesh-Surface-Pro-8:~/Documents/Conversation-Mode$ cd ec
+## aneesh@aneesh-Surface-Pro-8:~/Documents/Conversation-Mode/ec$ make
+gcc -Isrc -Wall -std=gnu99 -O3   -c -o src/audio.o src/audio.c
+gcc -Isrc -Wall -std=gnu99 -O3   -c -o src/fifo.o src/fifo.c
+gcc -Isrc -Wall -std=gnu99 -O3   -c -o src/pa_ringbuffer.o src/pa_ringbuffer.c
+gcc -Isrc -Wall -std=gnu99 -O3   -c -o src/util.o src/util.c
+gcc -Isrc -Wall -std=gnu99 -O3   -c -o src/ec.o src/ec.c
+g++ src/audio.o src/fifo.o src/pa_ringbuffer.o src/util.o src/ec.o -ldl -lm -Wl,-Bstatic -Wl,-Bdynamic -lrt -lpthread -lasound -lspeexdsp  -o ec
+gcc -Isrc -Wall -std=gnu99 -O3   -c -o src/ec_hw.o src/ec_hw.c
+g++ src/audio.o src/fifo.o src/pa_ringbuffer.o src/util.o src/ec_hw.o -ldl -lm -Wl,-Bstatic -Wl,-Bdynamic -lrt -lpthread -lasound -lspeexdsp  -o ec_hw
+## aneesh@aneesh-Surface-Pro-8:~/Documents/Conversation-Mode/ec$ cd src
+gcc -fPIC -shared -o libec.so ec.c audio.c fifo.c pa_ringbuffer.c util.c -lspeexdsp -lm -lpthread -lrt -lasound
+## aneesh@aneesh-Surface-Pro-8:~/Documents/Conversation-Mode/ec/src$ cd /home/aneesh/Documents/Conversation-Mode/ec/src
+gcc -fPIC -shared -rdynamic -o libec.so ec.c audio.c fifo.c pa_ringbuffer.c util.c -lspeexdsp -lm -lpthread -lrt -lasound
+
+## create ec_wrapper:
+
+import numpy as np
+import ctypes
+import os
+
+class EC:
+    def __init__(self, sample_rate, frame_size):
+        # Path to the shared library (relative to this file)
+        lib_path = os.path.join(os.path.dirname(__file__), '../ec/src/libec.so')
+        self.lib = ctypes.CDLL(lib_path)
+        self.frame_size = frame_size
+        self.sample_rate = sample_rate
+        # Create EC instance
+        self.obj = self.lib.ec_create(sample_rate, frame_size)
+        # Set argument/return types
+        self.lib.ec_create.restype = ctypes.c_void_p
+        self.lib.ec_destroy.argtypes = [ctypes.c_void_p]
+        self.lib.ec_process.argtypes = [ctypes.c_void_p,
+                                        ctypes.POINTER(ctypes.c_short),
+                                        ctypes.POINTER(ctypes.c_short),
+                                        ctypes.POINTER(ctypes.c_short)]
+
+    def echo_cancel(self, mic, ref):
+        # mic and ref must be int16 numpy arrays of length frame_size
+        out = np.zeros(self.frame_size, dtype=np.int16)
+        mic_ptr = mic.ctypes.data_as(ctypes.POINTER(ctypes.c_short))
+        ref_ptr = ref.ctypes.data_as(ctypes.POINTER(ctypes.c_short))
+        out_ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_short))
+        self.lib.ec_process(self.obj, mic_ptr, ref_ptr, out_ptr)
+        return out
+
+    def __del__(self):
+        if hasattr(self, 'obj') and self.obj:
+            self.lib.ec_destroy(self.obj)
+
+## create ec.h:
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define EXPORT __attribute__((visibility("default")))
+
+// Create a new echo canceller instance
+EXPORT void *ec_create(int rate, int frame_size);
+
+// Destroy an echo canceller instance
+EXPORT void ec_destroy(void *obj);
+
+// Perform echo cancellation
+EXPORT void ec_process(void *obj, short *mic, short *ref, short *out);
+
+#ifdef __cplusplus
+}
+#endif

@@ -82,46 +82,32 @@ REF_DEVICE_ID = int(os.getenv("REF_DEVICE_ID", REF_DEVICE_ID))
 sd.default.latency = "high"
 
 
-# ---------------------------
-# 2) LAUNCH EC EXECUTABLE (voice-engine/ec)
-# ---------------------------
-import atexit
-
-EC_INPUT_FIFO = "/tmp/ec.input"
-EC_OUTPUT_FIFO = "/tmp/ec.output"
-EC_PROCESS = None
-
-
 def start_ec_process():
-    global EC_PROCESS
-    # Clean up and create FIFOs
-    for fifo in [EC_INPUT_FIFO, EC_OUTPUT_FIFO]:
-        if os.path.exists(fifo):
-            os.remove(fifo)
-        os.mkfifo(fifo, mode=0o666)
-    # Start ec process in hardware-independent FIFO mode
-    ec_path = shutil.which("ec") or os.path.abspath(os.path.join(os.path.dirname(__file__), "../ec/ec"))
-    if not os.path.exists(ec_path):
-        print(f"❌ EC executable not found at {ec_path}")
-        return
-    # Use FIFO mode: ./ec -i /tmp/ec.input -o /tmp/ec.output -c 1 -s
-    args = [ec_path, "-i", EC_INPUT_FIFO, "-o", EC_OUTPUT_FIFO, "-c", "1", "-s"]
-    EC_PROCESS = subprocess.Popen(args)
-    print(f"✅ EC process started (FIFO mode): {' '.join(args)}")
+    global ec_aec
+    if ec_aec is None:
+        ec_aec = EC(DEVICE_RATE, FRAME_SIZE)
+        print("✅ EC (voice-engine/ec) started")
 
 def stop_ec_process():
-    global EC_PROCESS
-    if EC_PROCESS is not None:
-        EC_PROCESS.terminate()
-        EC_PROCESS.wait()
-        EC_PROCESS = None
-    # Clean up FIFOs
-    for fifo in [EC_INPUT_FIFO, EC_OUTPUT_FIFO]:
-        if os.path.exists(fifo):
-            os.remove(fifo)
+    global ec_aec
+    if ec_aec is not None:
+        del ec_aec
+        ec_aec = None
+        print("🛑 EC (voice-engine/ec) stopped")
 
-atexit.register(stop_ec_process)
-start_ec_process()
+# ---------------------------
+# 2) LOAD EC SHARED LIBRARY (voice-engine/ec)
+# ---------------------------
+# ---------------------------
+# 2) LOAD EC SHARED LIBRARY (voice-engine/ec)
+# ---------------------------
+from ec_wrapper import EC
+ec_aec = None
+try:
+    ec_aec = EC(DEVICE_RATE, FRAME_SIZE)
+    print("✅ EC (voice-engine/ec) loaded")
+except Exception as e:
+    print(f"❌ EC (voice-engine/ec) failed to load: {e}")
 
 # ---------------------------
 # 3) VOLUME CONTROL (pactl preferred, amixer fallback)
@@ -457,31 +443,15 @@ def processing_worker():
 
 
 
-        # Use EC executable via named pipes for echo cancellation
-        # Convert to int16 for EC
-        mic_int16 = (mic_dev * 32767.0).clip(-32768, 32767).astype(np.int16)
-        ref_int16 = (ref_dev * 32767.0).clip(-32768, 32767).astype(np.int16)
 
-        # Write reference audio to EC input FIFO
-        try:
-            with open(EC_INPUT_FIFO, "wb", buffering=0) as f_in:
-                f_in.write(ref_int16.tobytes())
-        except Exception as e:
-            print(f"[EC PIPE] Failed to write to {EC_INPUT_FIFO}: {e}")
-            cleaned_dev = mic_dev.astype(np.float32)
+        # Use EC Python wrapper for echo cancellation
+        if ec_aec is not None:
+            mic_int16 = (mic_dev * 32767.0).clip(-32768, 32767).astype(np.int16)
+            ref_int16 = (ref_dev * 32767.0).clip(-32768, 32767).astype(np.int16)
+            cleaned_int16 = ec_aec.echo_cancel(mic_int16, ref_int16)
+            cleaned_dev = cleaned_int16.astype(np.float32) / 32768.0
         else:
-            # Read processed audio from EC output FIFO
-            try:
-                with open(EC_OUTPUT_FIFO, "rb", buffering=0) as f_out:
-                    cleaned_bytes = f_out.read(mic_int16.nbytes)
-                    if len(cleaned_bytes) == mic_int16.nbytes:
-                        cleaned_int16 = np.frombuffer(cleaned_bytes, dtype=np.int16)
-                        cleaned_dev = cleaned_int16.astype(np.float32) / 32768.0
-                    else:
-                        cleaned_dev = mic_dev.astype(np.float32)
-            except Exception as e:
-                print(f"[EC PIPE] Failed to read from {EC_OUTPUT_FIFO}: {e}")
-                cleaned_dev = mic_dev.astype(np.float32)
+            cleaned_dev = mic_dev.astype(np.float32)
 
         cleaned_dev = highpass_dc_block(cleaned_dev, alpha=HP_ALPHA)
         cleaned_16k = resample_linear(cleaned_dev,
