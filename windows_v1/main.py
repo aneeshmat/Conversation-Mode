@@ -6,7 +6,7 @@ import queue
 import sys
 
 # --- Load Engine ---
-dll_path = os.path.abspath("aec_engine.dll")
+dll_path = os.path.abspath("aec_core_v2_1.dll")
 aec_lib = ctypes.CDLL(dll_path)
 aec_lib.aec_create.restype = ctypes.c_void_p
 aec_lib.aec_process.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_float]
