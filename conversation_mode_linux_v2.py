@@ -131,8 +131,8 @@ def audio_loop():
 
             print("Mic RMS:", float(np.sqrt(np.mean(mic_frame**2))))
             print("Ref RMS:", float(np.sqrt(np.mean(ref_frame**2))))
-print(np.allclose(frame[:,0], frame[:,1]))
-print(frame.shape)
+    print(np.allclose(frame[:,0], frame[:,1]))
+    print(frame.shape)
 
 
 audio_loop()
